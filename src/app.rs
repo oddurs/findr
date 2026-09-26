@@ -1117,12 +1117,13 @@ mod tests {
         let tmp = TempDir::new();
         let repo = tmp.path().join("repo");
         tmp.file("repo/new.txt", "");
-        let init = Command::new("git")
-            .arg("init")
-            .arg("-q")
-            .arg(&repo)
-            .output()
-            .unwrap();
+        // Run from a git hook, the suite inherits GIT_DIR, which would make `git init`
+        // reinitialise this repository instead of creating the one under test.
+        let mut init = Command::new("git");
+        for var in git::REPO_ENV {
+            init.env_remove(var);
+        }
+        let init = init.arg("init").arg("-q").arg(&repo).output().unwrap();
         assert!(init.status.success(), "git init: {init:?}");
 
         let mut app = App::new(&repo, None).unwrap();
@@ -1134,6 +1135,10 @@ mod tests {
         wait(&mut app, |a| a.git.is_some());
         let status = app.git.as_ref().unwrap().status_of(&repo.join("new.txt"));
         assert_eq!(status, Some(git::Status::Untracked));
+        // The whole repository rolls up to untracked; a status taken from the wrong
+        // repository (an inherited GIT_DIR) shows that one's files as deleted.
+        let whole = app.git.as_ref().unwrap().status_of(&repo);
+        assert_eq!(whole, Some(git::Status::Untracked));
 
         press(&mut app, "h");
         assert!(app.git.is_none());

@@ -39,6 +39,17 @@ pub struct Repo {
     statuses: Vec<(String, Status)>,
 }
 
+/// Variables through which git's own hooks and commands point git at a repository. findr
+/// finds the repository by path, so inheriting these (when started from a hook or a
+/// `git rebase -x` step) would describe some other repository.
+pub const REPO_ENV: [&str; 5] = [
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_COMMON_DIR",
+    "GIT_OBJECT_DIRECTORY",
+];
+
 /// The nearest ancestor of `dir` holding a `.git` (a directory, or a file in a worktree).
 pub fn find_root(dir: &Path) -> Option<PathBuf> {
     dir.ancestors()
@@ -73,7 +84,11 @@ pub fn spawn() -> (Sender<PathBuf>, Receiver<Response>) {
 
 impl Repo {
     pub fn load(root: &Path) -> io::Result<Repo> {
-        let out = Command::new("git")
+        let mut git = Command::new("git");
+        for var in REPO_ENV {
+            git.env_remove(var);
+        }
+        let out = git
             .arg("-C")
             .arg(root)
             .args([
