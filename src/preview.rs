@@ -215,7 +215,7 @@ impl Highlighter {
     fn new() -> Highlighter {
         let mut themes = ThemeSet::load_defaults();
         Highlighter {
-            syntaxes: SyntaxSet::load_defaults_newlines(),
+            syntaxes: two_face::syntax::extra_newlines(),
             theme: themes
                 .themes
                 .remove("base16-ocean.dark")
@@ -226,10 +226,9 @@ impl Highlighter {
     fn syntax_for(&self, path: &Path, first_line: &str) -> &SyntaxReference {
         let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
         let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-        // syntect's bundled grammars lack these; the nearest relative reads well enough.
+        // The few extensions bat's grammars do not claim, sent to their nearest relative.
         let ext = match ext {
-            "ts" | "tsx" | "mts" | "cts" | "jsx" | "mjs" | "cjs" => "js",
-            "fish" | "zsh" | "bash" => "sh",
+            "mts" | "cts" => "ts",
             "jsonc" | "json5" => "json",
             other => other,
         };
@@ -354,6 +353,25 @@ mod tests {
             lines[0].spans.len() > 2,
             "rust source should get several styled spans"
         );
+    }
+
+    #[test]
+    fn grammars_cover_what_developers_open() {
+        let tmp = TempDir::new();
+        for (file, syntax) in [
+            ("app.ts", "TypeScript"),
+            ("View.tsx", "TypeScriptReact"),
+            ("Cargo.toml", "TOML"),
+            ("config.fish", "Fish"),
+            ("Dockerfile", "Dockerfile"),
+            ("tsconfig.jsonc", "JSON"),
+            (".env", "DotENV"),
+        ] {
+            let Preview::Text { syntax: found, .. } = preview(tmp.file(file, "x = 1\n")) else {
+                panic!("{file}: expected text");
+            };
+            assert_eq!(found, syntax, "{file}");
+        }
     }
 
     #[test]
