@@ -381,21 +381,33 @@ fn draw_inspector(frame: &mut Frame, app: &App, theme: &Theme, r: &Regions) {
             .iter()
             .skip(app.preview_scroll)
             .take(height)
-            .map(|line| diff_line(line, theme))
+            .map(|line| diff_line(line, area.width as usize, theme))
             .collect(),
     };
     frame.render_widget(Paragraph::new(lines), area);
 }
 
-/// A diff line in the semantic roles: added success, removed danger, hunk headers info.
-fn diff_line(line: &DiffLine, theme: &Theme) -> Line<'static> {
-    let (text, style) = match line {
-        DiffLine::Hunk(t) => (t, Style::new().fg(theme.info)),
-        DiffLine::Added(t) => (t, Style::new().fg(theme.success)),
-        DiffLine::Removed(t) => (t, Style::new().fg(theme.danger)),
-        DiffLine::Context(t) => (t, Style::new()),
+/// A diff line: the marker in its semantic role (added success, removed danger), then the
+/// highlighted code on a faint wash of the same meaning. Hunk headers are info.
+fn diff_line(line: &DiffLine, width: usize, theme: &Theme) -> Line<'static> {
+    let (marker, code, color, bg) = match line {
+        DiffLine::Hunk(t) => return Line::styled(t.clone(), Style::new().fg(theme.info)),
+        DiffLine::Added(code) => ("+", code, theme.success, Some(theme.added_bg)),
+        DiffLine::Removed(code) => ("-", code, theme.danger, Some(theme.removed_bg)),
+        DiffLine::Context(code) => (" ", code, theme.muted, None),
     };
-    Line::styled(text.clone(), style)
+    let mut spans = vec![Span::styled(marker, Style::new().fg(color))];
+    spans.extend(code.spans.iter().cloned());
+    let mut line = Line::from(spans);
+    match bg {
+        Some(bg) => {
+            // The wash runs to the edge, as a changed row, not just under the text.
+            let pad = width.saturating_sub(line.width());
+            line.spans.push(Span::raw(" ".repeat(pad)));
+            line.patch_style(Style::new().bg(bg))
+        }
+        None => line,
+    }
 }
 
 /// The inspector's facts line: what kind of thing, how big, how old, who may touch it.
@@ -785,6 +797,26 @@ mod tests {
             status.contains("1 marked") && status.contains("hidden shown"),
             "{status}"
         );
+    }
+
+    #[test]
+    fn diff_lines_keep_code_colour_on_a_wash() {
+        let t = Theme::DARK;
+        let code = Line::from(Span::styled("fn", Style::new().fg(t.accent)));
+        let added = diff_line(&DiffLine::Added(code.clone()), 10, &t);
+        assert_eq!(added.spans[0].content, "+");
+        assert_eq!(added.spans[0].style.fg, Some(t.success));
+        assert_eq!(added.style.bg, Some(t.added_bg), "the whole line is washed");
+        assert_eq!(added.width(), 10, "to the edge of the inspector");
+        assert_eq!(
+            added.spans[1].style.fg,
+            Some(t.accent),
+            "code keeps its colour"
+        );
+        let removed = diff_line(&DiffLine::Removed(code.clone()), 10, &t);
+        assert_eq!(removed.style.bg, Some(t.removed_bg));
+        let context = diff_line(&DiffLine::Context(code), 10, &t);
+        assert_eq!(context.style.bg, None);
     }
 
     #[test]
