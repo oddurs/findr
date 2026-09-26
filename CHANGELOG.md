@@ -19,8 +19,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the latest outcome, or the keys that make sense for the selection.
 - A colour system by role, so each colour means one thing, and `--light` for light terminals.
 - Narrow terminals drop the parent column, then the preview, before squeezing the list.
-- Syntax-highlighted file previews, directory previews, and notes for binary and
-  empty files.
+- Syntax-highlighted file previews in over 200 languages (bat's grammars), directory
+  previews, and notes for binary and empty files.
 - Git status on every entry, rolled up to directories, with the branch in the header.
 - Fuzzy, smart-case filtering with `/`.
 - `D` shows a changed file's diff against `HEAD` in the inspector, and stays on while moving
