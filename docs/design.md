@@ -126,13 +126,13 @@ Everything on screen is built from these, in `src/ui/components.rs`:
 
 | Component | Looks like | Used for |
 | --- | --- | --- |
-| **Badge** | ` BROWSE ` on a tone | The mode |
-| **Chip** | coloured text, `·`-separated | Pending state in the status bar |
+| **Badge** | ` BROWSE ` on accent; ` CONFIRM ` on danger | The mode |
+| **Chip** | coloured text, spaced apart: `2 marked  1 item copied` | Pending state in the status bar |
 | **Hint** | `y` copy | Keys, in the command line and prompts |
 | **Facts** | `Rust · 12 K · 314 lines · 3m ago` | The inspector's second line |
 | **Row** | mark, status, icon, name, size | Every listing: context, listing, inspector, find |
-| **Prompt** | `rename ›` text, then `enter ok · esc cancel` | Any text input |
-| **Question** | `Move 3 items to the trash?  y yes · n no` | Confirmations |
+| **Prompt** | `rename ›` text, with `enter ok   esc cancel` flush right | Any text input |
+| **Question** | `Move 3 items to the trash?   y yes   n no` | Confirmations |
 | **Message** | `✓ pasted 3 items` / `✗ …` | Outcomes, success and error |
 | **Empty** | a muted sentence | An empty directory, no matches |
 | **Panel** | rounded border, accent title | Overlays: help, find |
@@ -144,6 +144,12 @@ Everything on screen is built from these, in `src/ui/components.rs`:
 - Rows are one line. Names truncate with `…` before sizes do; paths in find truncate from the
   left, since the end of a path is what tells files apart.
 - A scrollbar appears only when the listing overflows.
+
+## Where it lives
+
+`src/ui/theme.rs` holds the tokens (`Theme::DARK`, `Theme::LIGHT`), `src/ui/components.rs` the
+components, `src/ui/rows.rs` the row, and `src/ui/mod.rs` one function per region. A new view
+takes a `&Theme` and composes components; it does not name a colour.
 
 ## Copy
 

@@ -7,15 +7,15 @@ A terminal file browser for developers: Finder's column view, with git status,
 fuzzy filtering, and syntax-highlighted previews.
 
 ```
- ~/Code/findr/src                                                                    main ● ↑1
-   scripts/       │   fuzzy.rs                3.5 K │ preview.rs  Rust · 10 K
- M src/           │ M git.rs                  9.0 K │   1 //! The preview column, built on a worker
- ! target/        │   icons.rs                9.0 K▐│   2
-   Cargo.lock     │   main.rs                 7.7 K▐│   3 use std::fs::{self, File};
-   Cargo.toml     │   ops.rs                   11 K▐│   4 use std::io::Read;
-   CHANGELOG.md   │▌M preview.rs               10 K │   5 use std::path::{Path, PathBuf};
- NORMAL  -rw-r--r--  10 K  1m ago                                                      name↓  10/11
- ? help  f find  / filter  q quit
+ ~/Code/findr/src                                                                      main ● ↑1
+   docs/          │   fuzzy.rs                3.5 K │ preview.rs
+   scripts/       │   git.rs                  9.0 K │ Rust · 10 K · 312 lines · 5m ago · -rw-r--r--
+ M src/           │   icons.rs                9.0 K▐│   1 //! The preview column, built on a worker
+ ! target/        │ M main.rs                 8.2 K▐│   2
+   Cargo.lock     │   ops.rs                   11 K▐│   3 use std::fs::{self, File};
+   Cargo.toml     │▌  preview.rs               10 K▐│   4 use std::io::Read;
+ BROWSE                                                                               name↓ · 10/10
+ e edit   o open   / filter   f find   ? keys
 ```
 
 (Shown with `--no-icons`; with a Nerd Font every entry has a file-type icon.)
@@ -51,10 +51,13 @@ or run with `--no-icons`.
 ## Usage
 
 ```
-findr [PATH] [--cwd-file FILE] [--no-mouse] [--no-icons]
+findr [PATH] [--cwd-file FILE] [--no-mouse] [--no-icons] [--light]
 ```
 
-`PATH` may be a file, which opens its directory with the cursor on it. Press `?` for keys.
+`PATH` may be a file, which opens its directory with the cursor on it. The bottom line always
+shows the keys that make sense for what is selected; press `?` for all of them. `--light`
+picks colours for a light terminal background. How the screen is organised, and why, is in
+[docs/design.md](docs/design.md).
 While findr has the mouse, most terminals still select text with a modifier held (Option in
 iTerm2 and Ghostty, Shift in most others); `--no-mouse` gives it back entirely.
 

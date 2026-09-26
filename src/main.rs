@@ -22,16 +22,18 @@ use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{EnterAlternateScreen, enable_raw_mode};
 
 use app::{App, Effect};
+use ui::theme::Theme;
 
 const USAGE: &str = "\
 findr - a terminal file browser for developers
 
-usage: findr [PATH] [--cwd-file FILE] [--no-mouse] [--no-icons]
+usage: findr [PATH] [--cwd-file FILE] [--no-mouse] [--no-icons] [--light]
 
   PATH             directory to open, or a file to open with the cursor on it
   --cwd-file FILE  on quitting with q, write the final directory to FILE
   --no-mouse       leave the mouse to the terminal, for selecting text
   --no-icons       no file icons, for a terminal without a Nerd Font
+  --light          colours for a light terminal background
   -h, --help       show this help
   -V, --version    show the version
 
@@ -50,6 +52,7 @@ struct Options {
     cwd_file: Option<PathBuf>,
     mouse: bool,
     icons: bool,
+    light: bool,
 }
 
 fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Cli, String> {
@@ -59,6 +62,7 @@ fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Cli, String> {
         cwd_file: None,
         mouse: true,
         icons: true,
+        light: false,
     };
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
@@ -67,6 +71,7 @@ fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Cli, String> {
             Some("-V" | "--version") => return Ok(Cli::Version),
             Some("--no-mouse") => options.mouse = false,
             Some("--no-icons") => options.icons = false,
+            Some("--light") => options.light = true,
             Some("--cwd-file") => {
                 options.cwd_file = Some(args.next().ok_or("--cwd-file needs a path")?.into())
             }
@@ -105,7 +110,9 @@ fn main() -> ExitCode {
         cwd_file,
         mouse,
         icons,
+        light,
     } = options;
+    let theme = if light { Theme::LIGHT } else { Theme::DARK };
     let mut app = match App::new(&start, ops::Trash::detect()) {
         Ok(app) => app,
         Err(e) => {
@@ -126,7 +133,7 @@ fn main() -> ExitCode {
         }));
         capture_mouse();
     }
-    let result = run(&mut terminal, &mut app, mouse);
+    let result = run(&mut terminal, &mut app, mouse, &theme);
     if mouse {
         release_mouse();
     }
@@ -149,12 +156,17 @@ fn main() -> ExitCode {
 }
 
 /// The event loop. Returns whether the final directory should be written for the shell.
-fn run(terminal: &mut DefaultTerminal, app: &mut App, mouse: bool) -> io::Result<bool> {
+fn run(
+    terminal: &mut DefaultTerminal,
+    app: &mut App,
+    mouse: bool,
+    theme: &Theme,
+) -> io::Result<bool> {
     let mut dirty = true;
     loop {
         app.sync_preview();
         if dirty {
-            terminal.draw(|frame| ui::draw(frame, app))?;
+            terminal.draw(|frame| ui::draw(frame, app, theme))?;
             dirty = false;
         }
         // Poll quickly only while a worker owes us an answer.
@@ -235,6 +247,7 @@ mod tests {
                 cwd_file: cwd_file.map(PathBuf::from),
                 mouse,
                 icons,
+                light: false,
             }))
         };
         assert_eq!(args(&[]), run(".", None, true, true));
@@ -248,6 +261,10 @@ mod tests {
         );
         assert_eq!(args(&["--no-mouse", "src"]), run("src", None, false, true));
         assert_eq!(args(&["--no-icons"]), run(".", None, true, false));
+        let Ok(Cli::Run(light)) = args(&["--light"]) else {
+            panic!("--light should parse");
+        };
+        assert!(light.light);
         assert_eq!(args(&["-h"]), Ok(Cli::Help));
         assert_eq!(args(&["--version"]), Ok(Cli::Version));
         assert!(args(&["--cwd-file"]).is_err());
