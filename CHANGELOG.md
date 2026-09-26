@@ -23,6 +23,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   empty files.
 - Git status on every entry, rolled up to directories, with the branch in the header.
 - Fuzzy, smart-case filtering with `/`.
+- `D` shows a changed file's diff against `HEAD` in the inspector, and stays on while moving
+  between files, so reviewing changes is `j` and `k`.
 - Find anywhere below the current directory with `f` or `ctrl-p`, honouring `.gitignore`
   in every repository found, and jump to the result.
 - Copy, cut, paste, rename, create (with parent directories), and move to trash.

@@ -43,6 +43,7 @@ pub(super) const HELP: &[Help] = &[
     Help::Key("!", "shell here"),
     Help::Section("View"),
     Help::Key("J K", "scroll preview"),
+    Help::Key("D", "diff of a changed file"),
     Help::Key(".", "show hidden files"),
     Help::Key("s S", "cycle sort, reverse"),
     Help::Key("R", "reload"),
