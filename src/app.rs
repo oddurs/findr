@@ -165,6 +165,10 @@ pub struct App {
     requested: Option<PathBuf>,
     preview_tx: Sender<preview::Request>,
     preview_rx: Receiver<preview::Response>,
+    git_wanted: Option<PathBuf>,
+    git_pending: bool,
+    git_tx: Sender<PathBuf>,
+    git_rx: Receiver<git::Response>,
 }
 
 impl App {
@@ -179,6 +183,7 @@ impl App {
             _ => (start, None),
         };
         let (preview_tx, preview_rx) = preview::spawn();
+        let (git_tx, git_rx) = git::spawn();
         let mut app = App {
             cwd: dir.clone(),
             entries: Vec::new(),
@@ -206,6 +211,10 @@ impl App {
             requested: None,
             preview_tx,
             preview_rx,
+            git_wanted: None,
+            git_pending: false,
+            git_tx,
+            git_rx,
         };
         app.load(dir, select)?;
         Ok(app)
@@ -274,22 +283,47 @@ impl App {
         self.parent = entries;
     }
 
-    /// Reloads git status when the repository changed, or always with `force`.
+    /// Asks for git status when the repository changed, or always with `force`. The answer
+    /// arrives through `poll_git`.
     fn sync_git(&mut self, force: bool) {
         let root = git::find_root(&self.cwd);
-        if !force && self.git.as_ref().map(|r| &r.root) == root.as_ref() {
-            return;
+        // Another repository's status would be wrong here; the old one stays up only while it
+        // is still the right repository, so a refresh does not flicker.
+        if self.git.as_ref().map(|r| &r.root) != root.as_ref() {
+            self.git = None;
         }
-        self.git = None;
         let Some(root) = root else {
+            self.git_wanted = None;
             return;
         };
-        match Repo::load(&root) {
-            Ok(repo) => self.git = Some(repo),
-            // No git installed: browse without status.
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => self.error(format!("git: {e}")),
+        if !force && (self.git.is_some() || self.git_wanted.as_ref() == Some(&root)) {
+            return;
         }
+        self.git_wanted = Some(root.clone());
+        self.git_pending = true;
+        if self.git_tx.send(root).is_err() {
+            self.error("git worker stopped");
+        }
+    }
+
+    /// Takes finished git status. Returns whether anything visible changed.
+    pub fn poll_git(&mut self) -> bool {
+        let mut changed = false;
+        while let Ok(resp) = self.git_rx.try_recv() {
+            // An answer for a repository already left behind.
+            if Some(&resp.root) != self.git_wanted.as_ref() {
+                continue;
+            }
+            self.git_pending = false;
+            changed = true;
+            match resp.repo {
+                Ok(repo) => self.git = Some(repo),
+                // No git installed: browse without status.
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => self.error(format!("git: {e}")),
+            }
+        }
+        changed
     }
 
     /// Recomputes the visible entries from the filter and puts the cursor on `select`, else the top.
@@ -372,8 +406,11 @@ impl App {
         }
     }
 
-    pub fn preview_pending(&self) -> bool {
-        self.requested.is_some() && self.preview.as_ref().map(|(p, _)| p) != self.requested.as_ref()
+    /// Whether a worker owes us an answer, so the event loop should poll it soon.
+    pub fn pending(&self) -> bool {
+        let preview = self.requested.is_some()
+            && self.preview.as_ref().map(|(p, _)| p) != self.requested.as_ref();
+        preview || (self.git_pending && self.git_wanted.is_some())
     }
 
     /// Takes finished previews. Returns whether one worth showing arrived.
@@ -1054,18 +1091,58 @@ mod tests {
         assert_eq!(app.selected().unwrap().name, "app.rs");
     }
 
+    /// Polls the workers until `done` holds.
+    fn wait(app: &mut App, done: impl Fn(&App) -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !done(app) {
+            assert!(Instant::now() < deadline, "a worker never answered");
+            app.poll_preview();
+            app.poll_git();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     #[test]
     fn preview_arrives_from_the_worker() {
         let (_tmp, mut app) = setup();
         app.sync_preview();
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while !app.poll_preview() {
-            assert!(Instant::now() < deadline, "preview never arrived");
-            std::thread::sleep(Duration::from_millis(5));
-        }
+        wait(&mut app, |a| a.preview.is_some());
         assert!(
             matches!(&app.preview, Some((p, Preview::Dir(entries))) if p.ends_with("src") && entries.len() == 2)
         );
+    }
+
+    #[test]
+    fn git_status_arrives_from_the_worker_and_clears_outside_the_repo() {
+        let tmp = TempDir::new();
+        let repo = tmp.path().join("repo");
+        tmp.file("repo/new.txt", "");
+        // Run from a git hook, the suite inherits GIT_DIR, which would make `git init`
+        // reinitialise this repository instead of creating the one under test.
+        let mut init = Command::new("git");
+        for var in git::REPO_ENV {
+            init.env_remove(var);
+        }
+        let init = init.arg("init").arg("-q").arg(&repo).output().unwrap();
+        assert!(init.status.success(), "git init: {init:?}");
+
+        let mut app = App::new(&repo, None).unwrap();
+        assert!(
+            app.git.is_none(),
+            "status must not be read on the event loop"
+        );
+        assert!(app.pending());
+        wait(&mut app, |a| a.git.is_some());
+        let status = app.git.as_ref().unwrap().status_of(&repo.join("new.txt"));
+        assert_eq!(status, Some(git::Status::Untracked));
+        // The whole repository rolls up to untracked; a status taken from the wrong
+        // repository (an inherited GIT_DIR) shows that one's files as deleted.
+        let whole = app.git.as_ref().unwrap().status_of(&repo);
+        assert_eq!(whole, Some(git::Status::Untracked));
+
+        press(&mut app, "h");
+        assert!(app.git.is_none());
+        assert!(!app.pending());
     }
 
     #[test]

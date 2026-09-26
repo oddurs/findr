@@ -3,6 +3,8 @@
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::thread;
 
 /// Ordered by how much it matters, so a directory shows the most pressing status inside it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -37,6 +39,17 @@ pub struct Repo {
     statuses: Vec<(String, Status)>,
 }
 
+/// Variables through which git's own hooks and commands point git at a repository. findr
+/// finds the repository by path, so inheriting these (when started from a hook or a
+/// `git rebase -x` step) would describe some other repository.
+pub const REPO_ENV: [&str; 5] = [
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_COMMON_DIR",
+    "GIT_OBJECT_DIRECTORY",
+];
+
 /// The nearest ancestor of `dir` holding a `.git` (a directory, or a file in a worktree).
 pub fn find_root(dir: &Path) -> Option<PathBuf> {
     dir.ancestors()
@@ -44,9 +57,38 @@ pub fn find_root(dir: &Path) -> Option<PathBuf> {
         .map(Path::to_path_buf)
 }
 
+pub struct Response {
+    pub root: PathBuf,
+    pub repo: io::Result<Repo>,
+}
+
+/// A worker that runs `git status` for repository roots sent to it. In a large repository
+/// that takes long enough to stall the cursor, so it never runs on the event loop.
+pub fn spawn() -> (Sender<PathBuf>, Receiver<Response>) {
+    let (req_tx, req_rx) = mpsc::channel::<PathBuf>();
+    let (resp_tx, resp_rx) = mpsc::channel();
+    thread::spawn(move || {
+        while let Ok(mut root) = req_rx.recv() {
+            // Only the newest request matters; the rest are for places already left behind.
+            while let Ok(newer) = req_rx.try_recv() {
+                root = newer;
+            }
+            let repo = Repo::load(&root);
+            if resp_tx.send(Response { root, repo }).is_err() {
+                break;
+            }
+        }
+    });
+    (req_tx, resp_rx)
+}
+
 impl Repo {
     pub fn load(root: &Path) -> io::Result<Repo> {
-        let out = Command::new("git")
+        let mut git = Command::new("git");
+        for var in REPO_ENV {
+            git.env_remove(var);
+        }
+        let out = git
             .arg("-C")
             .arg(root)
             .args([
