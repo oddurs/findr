@@ -1,8 +1,9 @@
 //! The preview column, built on a worker thread so highlighting never stalls the cursor.
 
 use std::fs::{self, File};
-use std::io::Read;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 
@@ -15,6 +16,7 @@ use syntect::util::LinesWithEndings;
 use unicode_width::UnicodeWidthChar;
 
 use crate::dir::{self, Entry, SortKey};
+use crate::git;
 
 const MAX_BYTES: u64 = 256 * 1024;
 const MAX_LINES: usize = 500;
@@ -31,16 +33,38 @@ pub enum Preview {
         /// The file was longer than the preview reads.
         truncated: bool,
     },
+    /// What changed in the file against HEAD.
+    Diff {
+        lines: Vec<DiffLine>,
+        added: usize,
+        removed: usize,
+    },
     Note(String),
 }
 
-pub struct Request {
+/// A diff line, classified here so the UI can colour it from the theme.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DiffLine {
+    Hunk(String),
+    Added(String),
+    Removed(String),
+    Context(String),
+}
+
+/// What a preview is of: a path, and whether it shows the file's diff instead of its content.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Key {
     pub path: PathBuf,
+    pub diff: bool,
+}
+
+pub struct Request {
+    pub key: Key,
     pub show_hidden: bool,
 }
 
 pub struct Response {
-    pub path: PathBuf,
+    pub key: Key,
     pub preview: Preview,
 }
 
@@ -57,7 +81,7 @@ pub fn spawn() -> (Sender<Request>, Receiver<Response>) {
             let preview = build(&req, &mut highlighter);
             if resp_tx
                 .send(Response {
-                    path: req.path,
+                    key: req.key,
                     preview,
                 })
                 .is_err()
@@ -70,12 +94,16 @@ pub fn spawn() -> (Sender<Request>, Receiver<Response>) {
 }
 
 fn build(req: &Request, highlighter: &mut Option<Highlighter>) -> Preview {
-    let meta = match fs::metadata(&req.path) {
+    let path = &req.key.path;
+    if req.key.diff {
+        return diff(path).unwrap_or_else(|e| Preview::Note(format!("git diff: {e}")));
+    }
+    let meta = match fs::metadata(path) {
         Ok(meta) => meta,
         Err(e) => return Preview::Note(e.to_string()),
     };
     if meta.is_dir() {
-        return match dir::list(&req.path, req.show_hidden) {
+        return match dir::list(path, req.show_hidden) {
             Ok(mut entries) => {
                 dir::sort(&mut entries, SortKey::Name, false);
                 entries.truncate(MAX_DIR_ENTRIES);
@@ -91,7 +119,7 @@ fn build(req: &Request, highlighter: &mut Option<Highlighter>) -> Preview {
         return Preview::Note("empty file".into());
     }
     let mut buf = Vec::new();
-    if let Err(e) = File::open(&req.path).and_then(|f| f.take(MAX_BYTES).read_to_end(&mut buf)) {
+    if let Err(e) = File::open(path).and_then(|f| f.take(MAX_BYTES).read_to_end(&mut buf)) {
         return Preview::Note(e.to_string());
     }
     if buf[..buf.len().min(8000)].contains(&0) {
@@ -100,13 +128,82 @@ fn build(req: &Request, highlighter: &mut Option<Highlighter>) -> Preview {
     let text = String::from_utf8_lossy(&buf);
     let (lines, syntax) = highlighter
         .get_or_insert_with(Highlighter::new)
-        .highlight(&req.path, &text);
+        .highlight(path, &text);
     let truncated = meta.len() > MAX_BYTES || lines.len() == MAX_LINES;
     Preview::Text {
         lines,
         syntax,
         truncated,
     }
+}
+
+/// The file's changes against HEAD, staged or not. In a repository with no commits yet there
+/// is no HEAD, so it falls back to the unstaged changes.
+fn diff(path: &Path) -> io::Result<Preview> {
+    let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
+        return Err(io::Error::other("no file name"));
+    };
+    let run = |base: &[&str]| {
+        let mut git = Command::new("git");
+        for var in git::REPO_ENV {
+            git.env_remove(var);
+        }
+        git.arg("-C")
+            .arg(dir)
+            .args(["diff", "--no-color", "--no-ext-diff"])
+            .args(base)
+            .arg("--")
+            .arg(name)
+            .stdin(Stdio::null())
+            .output()
+    };
+    let mut out = run(&["HEAD"])?;
+    if !out.status.success() {
+        out = run(&[])?;
+    }
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        return Err(io::Error::other(err.trim().to_string()));
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    if text.trim().is_empty() {
+        return Ok(Preview::Note("no changes against HEAD".into()));
+    }
+    let (mut added, mut removed) = (0, 0);
+    let mut lines = Vec::new();
+    let mut in_hunks = false;
+    for raw in text.lines() {
+        let line = clean(raw, &mut 0);
+        // Everything before the first hunk is the file header (diff --git, index, ---, +++),
+        // naming what the inspector's title already names. Only its position identifies it: a
+        // removed SQL comment is also a line starting "--- ".
+        if !in_hunks {
+            if !raw.starts_with("@@") {
+                continue;
+            }
+            in_hunks = true;
+        }
+        let kind = if raw.starts_with("@@") {
+            DiffLine::Hunk(line)
+        } else if raw.starts_with('+') {
+            added += 1;
+            DiffLine::Added(line)
+        } else if raw.starts_with('-') {
+            removed += 1;
+            DiffLine::Removed(line)
+        } else {
+            DiffLine::Context(line)
+        };
+        // Counted in full, shown up to the cap: the totals should not lie about a long diff.
+        if lines.len() < MAX_LINES {
+            lines.push(kind);
+        }
+    }
+    Ok(Preview::Diff {
+        lines,
+        added,
+        removed,
+    })
 }
 
 struct Highlighter {
@@ -226,7 +323,7 @@ mod tests {
     fn preview(path: PathBuf) -> Preview {
         build(
             &Request {
-                path,
+                key: Key { path, diff: false },
                 show_hidden: false,
             },
             &mut None,
@@ -280,6 +377,86 @@ mod tests {
         };
         let names: Vec<_> = entries.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(names, ["a", "b"]);
+    }
+
+    fn git(dir: &Path, args: &[&str]) {
+        let mut cmd = Command::new("git");
+        for var in git::REPO_ENV {
+            cmd.env_remove(var);
+        }
+        let out = cmd
+            .arg("-C")
+            .arg(dir)
+            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+    }
+
+    #[test]
+    fn diff_shows_what_changed_against_head() {
+        let tmp = TempDir::new();
+        git(tmp.path(), &["init", "-q"]);
+        let file = tmp.file("lib.rs", "one\ntwo\nthree\n");
+        git(tmp.path(), &["add", "."]);
+        git(tmp.path(), &["commit", "-qm", "init"]);
+        fs::write(&file, "one\n2\nthree\nfour\n").unwrap();
+        let req = Request {
+            key: Key {
+                path: file.clone(),
+                diff: true,
+            },
+            show_hidden: false,
+        };
+        let Preview::Diff {
+            lines,
+            added,
+            removed,
+        } = build(&req, &mut None)
+        else {
+            panic!("expected a diff");
+        };
+        assert_eq!((added, removed), (2, 1));
+        assert!(lines.contains(&DiffLine::Removed("-two".into())));
+        assert!(lines.contains(&DiffLine::Added("+four".into())));
+        assert!(
+            matches!(lines[0], DiffLine::Hunk(_)),
+            "headers are skipped: {lines:?}"
+        );
+
+        // Content that looks like a file header is still content.
+        let sql = tmp.file("q.sql", "-- note\nselect 1;\n");
+        git(tmp.path(), &["add", "q.sql"]);
+        git(tmp.path(), &["commit", "-qm", "sql"]);
+        fs::write(&sql, "select 1;\n++ added\n").unwrap();
+        let req_sql = Request {
+            key: Key {
+                path: sql,
+                diff: true,
+            },
+            show_hidden: false,
+        };
+        let Preview::Diff {
+            lines,
+            added,
+            removed,
+        } = build(&req_sql, &mut None)
+        else {
+            panic!("expected a diff");
+        };
+        assert_eq!((added, removed), (1, 1));
+        assert!(
+            lines.contains(&DiffLine::Removed("--- note".into())),
+            "{lines:?}"
+        );
+        assert!(
+            lines.contains(&DiffLine::Added("+++ added".into())),
+            "{lines:?}"
+        );
+
+        git(tmp.path(), &["checkout", "--", "lib.rs"]);
+        assert!(matches!(build(&req, &mut None), Preview::Note(n) if n.contains("no changes")));
     }
 
     #[test]

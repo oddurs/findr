@@ -19,7 +19,7 @@ use unicode_width::UnicodeWidthStr;
 use crate::app::{App, Areas, Confirm, MessageKind, Mode, count, parent_offset};
 use crate::dir::{self, Entry};
 use crate::icons;
-use crate::preview::Preview;
+use crate::preview::{DiffLine, Preview};
 
 mod components;
 mod overlays;
@@ -323,7 +323,7 @@ fn draw_inspector(frame: &mut Frame, app: &App, theme: &Theme, r: &Regions) {
     let preview = app
         .preview
         .as_ref()
-        .filter(|(p, _)| *p == entry.path)
+        .filter(|(key, _)| key.path == entry.path)
         .map(|(_, p)| p);
 
     let mut title = Vec::new();
@@ -377,8 +377,25 @@ fn draw_inspector(frame: &mut Frame, app: &App, theme: &Theme, r: &Regions) {
             .take(height)
             .cloned()
             .collect(),
+        Some(Preview::Diff { lines, .. }) => lines
+            .iter()
+            .skip(app.preview_scroll)
+            .take(height)
+            .map(|line| diff_line(line, theme))
+            .collect(),
     };
     frame.render_widget(Paragraph::new(lines), area);
+}
+
+/// A diff line in the semantic roles: added success, removed danger, hunk headers info.
+fn diff_line(line: &DiffLine, theme: &Theme) -> Line<'static> {
+    let (text, style) = match line {
+        DiffLine::Hunk(t) => (t, Style::new().fg(theme.info)),
+        DiffLine::Added(t) => (t, Style::new().fg(theme.success)),
+        DiffLine::Removed(t) => (t, Style::new().fg(theme.danger)),
+        DiffLine::Context(t) => (t, Style::new()),
+    };
+    Line::styled(text.clone(), style)
 }
 
 /// The inspector's facts line: what kind of thing, how big, how old, who may touch it.
@@ -401,6 +418,9 @@ fn entry_facts(entry: &Entry, preview: Option<&Preview>) -> Vec<String> {
                 "{syntax} · {} · {n}{more} {noun}",
                 dir::human_size(entry.size)
             )
+        }
+        Some(Preview::Diff { added, removed, .. }) => {
+            format!("changes against HEAD · +{added} −{removed}")
         }
         Some(Preview::Note(note)) => note.clone(),
         None if entry.is_dir => String::new(),
@@ -566,9 +586,12 @@ fn browse_hints(app: &App) -> Vec<(&'static str, String)> {
     }
     match app.selected() {
         Some(e) if e.is_dir => h.push(("l", "open".into())),
-        Some(_) => {
+        Some(e) => {
             h.push(("e", "edit".into()));
             h.push(("o", "open".into()));
+            if app.has_changes(e) {
+                h.push(("D", if app.diff { "content" } else { "diff" }.into()));
+            }
         }
         None => h.push(("a", "new file".into())),
     }

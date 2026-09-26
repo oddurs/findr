@@ -63,7 +63,7 @@ it; nothing appears in two regions.
 | Context | Where did I come from? | Parent listing, the current directory marked | Muted |
 | Listing | What is here, and which one am I on? | Entries, git status, marks, sizes, cursor | **Primary** |
 | Filter | How is the listing narrowed? | The query and the match count, on the listing | Accent while active |
-| Inspector | Is this the one? | Title, a line of facts, then the content | Primary content, muted facts |
+| Inspector | Is this the one? What changed? | Title, a line of facts, then the content — or, with `D` on a changed file, its diff | Primary content, muted facts |
 | Status | What mode am I in, what is pending? | Mode, marks, clipboard, paste progress, hidden, sort, position | Muted except pending state |
 | Command | What do I type, what happened, what next? | A prompt, or a message, or contextual key hints | Changes by moment |
 
@@ -118,7 +118,8 @@ and those have a light variant.
 | `surface.context` | grey 236 | grey 254 | The current directory in the context column |
 
 Git status maps onto the semantic roles: modified → warning, added → success, deleted and
-conflicted → danger, renamed → info, untracked → danger (lighter), ignored → muted.
+conflicted → danger, renamed → info, untracked → danger (lighter), ignored → muted. A diff uses
+the same roles: added lines success, removed lines danger, hunk headers info.
 
 ## Components
 

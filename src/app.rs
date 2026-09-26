@@ -258,7 +258,10 @@ pub struct App {
     pub job: Option<Job>,
     pub git: Option<Repo>,
     pub message: Option<Message>,
-    pub preview: Option<(PathBuf, Preview)>,
+    pub preview: Option<(preview::Key, Preview)>,
+    /// Show a changed file's diff in the inspector instead of its content. Sticky, so the
+    /// changes can be reviewed file by file with j and k.
+    pub diff: bool,
     pub preview_scroll: usize,
     /// Rows in the file list, recorded by the last draw; drives page movement.
     pub page: usize,
@@ -268,7 +271,7 @@ pub struct App {
     cursors: HashMap<PathBuf, String>,
     cwd_mtime: Option<SystemTime>,
     trash: Option<Trash>,
-    requested: Option<PathBuf>,
+    requested: Option<preview::Key>,
     preview_tx: Sender<preview::Request>,
     preview_rx: Receiver<preview::Response>,
     git_wanted: Option<PathBuf>,
@@ -319,6 +322,7 @@ impl App {
             cwd_mtime: None,
             trash,
             requested: None,
+            diff: false,
             preview_tx,
             preview_rx,
             git_wanted: None,
@@ -501,17 +505,31 @@ impl App {
         }
     }
 
+    /// Whether git has a diff to show for `entry`: a tracked file with changes.
+    pub fn has_changes(&self, entry: &Entry) -> bool {
+        use git::Status::{Added, Conflicted, Modified, Renamed};
+        !entry.is_dir
+            && self
+                .git
+                .as_ref()
+                .and_then(|r| r.status_of(&entry.path))
+                .is_some_and(|s| matches!(s, Modified | Added | Renamed | Conflicted))
+    }
+
     /// Asks the worker for the selected entry's preview if it is not already the one requested.
     pub fn sync_preview(&mut self) {
-        let want = self.selected().map(|e| e.path.clone());
+        let want = self.selected().map(|e| preview::Key {
+            path: e.path.clone(),
+            diff: self.diff && self.has_changes(e),
+        });
         if want == self.requested {
             return;
         }
         self.requested = want.clone();
         self.preview_scroll = 0;
-        if let Some(path) = want {
+        if let Some(key) = want {
             let req = preview::Request {
-                path,
+                key,
                 show_hidden: self.show_hidden,
             };
             if self.preview_tx.send(req).is_err() {
@@ -523,7 +541,7 @@ impl App {
     /// Whether a worker owes us an answer, so the event loop should poll it soon.
     pub fn pending(&self) -> bool {
         let preview = self.requested.is_some()
-            && self.preview.as_ref().map(|(p, _)| p) != self.requested.as_ref();
+            && self.preview.as_ref().map(|(k, _)| k) != self.requested.as_ref();
         let indexing = matches!(&self.mode, Mode::Find(f) if f.indexing());
         preview || (self.git_pending && self.git_wanted.is_some()) || self.job.is_some() || indexing
     }
@@ -532,8 +550,8 @@ impl App {
     pub fn poll_preview(&mut self) -> bool {
         let mut fresh = false;
         while let Ok(resp) = self.preview_rx.try_recv() {
-            if Some(&resp.path) == self.requested.as_ref() {
-                self.preview = Some((resp.path, resp.preview));
+            if Some(&resp.key) == self.requested.as_ref() {
+                self.preview = Some((resp.key, resp.preview));
                 fresh = true;
             }
         }
@@ -649,11 +667,11 @@ impl App {
                 }
             }
             MouseEventKind::Down(MouseButton::Left) if areas.preview.contains(at) => {
-                let Some((dir, Preview::Dir(entries))) = &self.preview else {
+                let Some((key, Preview::Dir(entries))) = &self.preview else {
                     return None;
                 };
                 let entry = entries.get(self.preview_scroll + row(areas.preview))?;
-                let (dir, name) = (dir.clone(), entry.name.clone());
+                let (dir, name) = (key.path.clone(), entry.name.clone());
                 self.enter(dir, Some(name));
             }
             _ => {}
@@ -733,6 +751,15 @@ impl App {
                 self.reload();
                 self.sync_git(true);
                 self.info("reloaded");
+            }
+            KeyCode::Char('D') => {
+                self.diff = !self.diff;
+                let changed = self.selected().is_some_and(|e| self.has_changes(e));
+                match (self.diff, changed) {
+                    (true, false) => self.info("diffs on: shown for changed files"),
+                    (false, false) => self.info("diffs off"),
+                    _ => {}
+                }
             }
             KeyCode::Char('J') => self.scroll_preview(PREVIEW_STEP as isize),
             KeyCode::Char('K') => self.scroll_preview(-(PREVIEW_STEP as isize)),
@@ -967,6 +994,7 @@ impl App {
     fn scroll_preview(&mut self, delta: isize) {
         let max = match &self.preview {
             Some((_, Preview::Text { lines, .. })) => lines.len().saturating_sub(1),
+            Some((_, Preview::Diff { lines, .. })) => lines.len().saturating_sub(1),
             Some((_, Preview::Dir(entries))) => entries.len().saturating_sub(1),
             _ => 0,
         };
@@ -1492,7 +1520,7 @@ mod tests {
         app.sync_preview();
         wait(&mut app, |a| a.preview.is_some());
         assert!(
-            matches!(&app.preview, Some((p, Preview::Dir(entries))) if p.ends_with("src") && entries.len() == 2)
+            matches!(&app.preview, Some((k, Preview::Dir(entries))) if k.path.ends_with("src") && entries.len() == 2)
         );
     }
 
@@ -1614,7 +1642,11 @@ mod tests {
             syntax: "Plain Text".into(),
             truncated: false,
         };
-        app.preview = Some((app.cwd.clone(), text));
+        let key = preview::Key {
+            path: app.cwd.clone(),
+            diff: false,
+        };
+        app.preview = Some((key, text));
         wheel(&mut app, MouseEventKind::ScrollDown, 40);
         assert_eq!(app.preview_scroll, WHEEL_STEP as usize);
         assert_eq!(app.selected, 0, "the list stays put under a preview scroll");
@@ -1641,6 +1673,56 @@ mod tests {
         click(&mut app, 3, 1 + row);
         assert_eq!(app.cwd, tmp.path());
         assert_eq!(app.selected().unwrap().name, "README.md");
+    }
+
+    #[test]
+    fn d_shows_the_diff_only_for_changed_files() {
+        let tmp = TempDir::new();
+        let git = |args: &[&str]| {
+            let mut cmd = Command::new("git");
+            for var in git::REPO_ENV {
+                cmd.env_remove(var);
+            }
+            let out = cmd
+                .arg("-C")
+                .arg(tmp.path())
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}: {out:?}");
+        };
+        git(&["init", "-q"]);
+        tmp.file("changed.rs", "a\n");
+        tmp.file("clean.rs", "b\n");
+        git(&["add", "."]);
+        git(&["commit", "-qm", "init"]);
+        fs::write(tmp.path().join("changed.rs"), "a\nb\n").unwrap();
+
+        let mut app = App::new(tmp.path(), None).unwrap();
+        wait(&mut app, |a| a.git.is_some());
+        press(&mut app, "D");
+        app.sync_preview();
+        wait(&mut app, |a| a.preview.is_some() && !a.pending());
+        let (key, preview) = app.preview.as_ref().unwrap();
+        assert!(key.diff && key.path.ends_with("changed.rs"));
+        assert!(matches!(
+            preview,
+            Preview::Diff {
+                added: 1,
+                removed: 0,
+                ..
+            }
+        ));
+
+        press(&mut app, "j");
+        app.sync_preview();
+        wait(&mut app, |a| !a.pending());
+        let (key, _) = app.preview.as_ref().unwrap();
+        assert!(
+            !key.diff,
+            "a clean file shows its content even with diffs on"
+        );
     }
 
     #[test]

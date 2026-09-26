@@ -25,7 +25,8 @@ fuzzy filtering, and syntax-highlighted previews.
 - **Three columns**: parent, current, preview. Previews are highlighted and built on a
   background thread, so holding `j` never stutters.
 - **Git status** on every entry, rolled up to directories, with ignored files dimmed and the
-  branch in the header.
+  branch in the header. `D` swaps a changed file's preview for its diff against `HEAD`, so a
+  review is `D` then `j` `k` through the `M`s.
 - **Fuzzy filter** with `/`, ranked like fzf and smart-case.
 - **Find anywhere below** with `f` or `ctrl-p`: every file and directory under the current one,
   honouring `.gitignore` in each repository it meets, including a directory full of checkouts.
@@ -82,6 +83,7 @@ iTerm2 and Ghostty, Shift in most others); `--no-mouse` gives it back entirely.
 | `c` | copy path to clipboard |
 | `!` | shell here |
 | `J` `K` | scroll preview |
+| `D` | show a changed file's diff instead of its content (stays on as you move) |
 | `.` | show hidden files |
 | `s` `S` | cycle sort (name, modified, size, type), reverse |
 | `R` | reload |
