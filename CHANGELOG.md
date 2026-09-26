@@ -29,8 +29,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Find anywhere below the current directory with `f` or `ctrl-p`, honouring `.gitignore`
   in every repository found, and jump to the result.
 - Copy, cut, paste, rename, create (with parent directories), and move to trash.
-- `u` undoes trashing, most recent first, back to the start of the session; a name taken
-  since comes back as `name copy` rather than overwriting.
+- `u` undoes, most recent first and back to the start of the session: trash is restored,
+  renames (single or bulk) are reversed, a cut is moved back, and pasted copies, new files and
+  new directories go to the trash. Nothing is overwritten: a name taken since comes back as
+  `name copy`, and a rename is not reversed onto a file that has appeared in its place.
 - Bulk rename: with entries marked, `r` opens their names in `$EDITOR`; the edited list is
   checked as a whole (count, empty names, duplicates, clashes) before anything moves, and
   swaps and chains work.

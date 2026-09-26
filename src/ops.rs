@@ -161,6 +161,25 @@ pub fn apply_renames(plan: &[(PathBuf, PathBuf)]) -> io::Result<usize> {
     Ok(plan.len())
 }
 
+/// Undoes renames from `plan_renames`: every item goes back to its old name. Refuses, moving
+/// nothing, if one of those names has been taken since by something outside the plan.
+pub fn reverse_renames(plan: &[(PathBuf, PathBuf)]) -> io::Result<usize> {
+    let back: Vec<(PathBuf, PathBuf)> = plan
+        .iter()
+        .map(|(from, to)| (to.clone(), from.clone()))
+        .collect();
+    for (_, old) in &back {
+        let vacating = back.iter().any(|(current, _)| current == old);
+        if occupied(old) && !vacating {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("{} exists again; nothing renamed back", old.display()),
+            ));
+        }
+    }
+    apply_renames(&back)
+}
+
 /// Copies files, directories and symlinks (as links) from `src` to `dst`, which must not exist.
 pub fn copy_all(src: &Path, dst: &Path) -> io::Result<()> {
     let meta = fs::symlink_metadata(src)?;
@@ -194,6 +213,8 @@ pub fn move_path(src: &Path, dst: &Path) -> io::Result<()> {
 
 pub struct Pasted {
     pub done: usize,
+    /// Each item that arrived, as (where it came from, where it went), for undo.
+    pub moved: Vec<(PathBuf, PathBuf)>,
     /// The name the last item landed under, for putting the cursor on it.
     pub last: Option<String>,
     pub failure: Option<String>,
@@ -204,6 +225,7 @@ pub struct Pasted {
 pub fn paste(paths: &[PathBuf], dest: &Path, cut: bool, mut progress: impl FnMut(usize)) -> Pasted {
     let mut pasted = Pasted {
         done: 0,
+        moved: Vec::new(),
         last: None,
         failure: None,
     };
@@ -228,6 +250,7 @@ pub fn paste(paths: &[PathBuf], dest: &Path, cut: bool, mut progress: impl FnMut
             Ok(dst) => {
                 pasted.done += 1;
                 pasted.last = dst.file_name().map(|n| n.to_string_lossy().into_owned());
+                pasted.moved.push((src.clone(), dst));
                 progress(pasted.done);
             }
             Err(e) => {
@@ -471,6 +494,25 @@ mod tests {
             3,
             "no temporary names left"
         );
+    }
+
+    #[test]
+    fn renames_reverse_unless_an_old_name_was_taken() {
+        let tmp = TempDir::new();
+        let a = tmp.file("a", "was a");
+        let b = tmp.file("b", "was b");
+        let plan = plan_renames(&[a.clone(), b.clone()], "b\nc\n").unwrap();
+        apply_renames(&plan).unwrap();
+        assert_eq!(reverse_renames(&plan).unwrap(), 2);
+        assert_eq!(fs::read_to_string(&a).unwrap(), "was a");
+        assert_eq!(fs::read_to_string(&b).unwrap(), "was b");
+
+        let plan = plan_renames(std::slice::from_ref(&a), "z\n").unwrap();
+        apply_renames(&plan).unwrap();
+        tmp.file("a", "someone else's");
+        let err = reverse_renames(&plan).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        assert!(tmp.path().join("z").exists(), "nothing moved");
     }
 
     #[test]

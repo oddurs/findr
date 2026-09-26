@@ -76,7 +76,7 @@ iTerm2 and Ghostty, Shift in most others); `--no-mouse` gives it back entirely.
 | `space` | mark (marks apply to y x d e o c) |
 | `y` `x` `p` | copy, cut, paste |
 | `d` | move to trash (asks first) |
-| `u` | undo the last trash; again for the one before |
+| `u` | undo the last trash, rename, paste or new file; again for the one before |
 | `r` | rename; with marks, rename them all at once in `$EDITOR`, one name per line |
 | `a` `A` | new file (a trailing `/` makes a directory), new directory |
 | `e` | edit in `$VISUAL` / `$EDITOR` |
