@@ -7,16 +7,7 @@ use ratatui::widgets::Block;
 
 use super::theme::{Theme, Tone};
 
-/// The mode, as ` BROWSE ` on its tone.
-pub fn badge(label: &str, tone: Tone, theme: &Theme) -> Span<'static> {
-    let style = Style::new()
-        .fg(theme.on_badge)
-        .bg(theme.tone(tone))
-        .add_modifier(Modifier::BOLD);
-    Span::styled(format!(" {label} "), style)
-}
-
-/// A piece of pending state in the status bar.
+/// A piece of pending state on the bottom bar.
 pub fn chip(text: String, tone: Tone, theme: &Theme) -> Span<'static> {
     Span::styled(text, Style::new().fg(theme.tone(tone)))
 }

@@ -7,5 +7,5 @@ expression: "snapshot.join(\"\\n\")"
 │   󰈙 notes.txt                5 B│     lib.rs                                0 B
 │                                 │     main.rs                              13 B
 │                                 │                                               
- BROWSE                                                                                 name↓ · 1/3 
- l open   / filter   f find   ? keys
+│                                 │                                               
+ ? for keys                                                                                  1 of 3

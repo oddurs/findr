@@ -688,7 +688,7 @@ impl App {
                     // The marks named the old paths.
                     self.marked.clear();
                     self.undo.push(Undo::Rename(plan));
-                    self.success(format!("renamed {} · u to undo", count(n)));
+                    self.success(format!("renamed {}, u to undo", count(n)));
                 }
                 Err(e) => self.error(e.to_string()),
             },
@@ -1264,7 +1264,7 @@ impl App {
             return;
         }
         let verb = if cut { "cut" } else { "copied" };
-        self.info(format!("{verb} {} — p to paste", count(paths.len())));
+        self.info(format!("{verb} {}, p to paste", count(paths.len())));
         self.clip = Some(Clip { paths, cut });
         self.marked.clear();
     }
@@ -1349,7 +1349,7 @@ impl App {
         let done = pasted.done;
         match pasted.failure {
             Some(f) => self.error(format!("pasted {done} of {total}: {f}")),
-            None => self.success(format!("pasted {} · u to undo", count(done))),
+            None => self.success(format!("pasted {}, u to undo", count(done))),
         }
     }
 
@@ -1382,7 +1382,7 @@ impl App {
         self.sync_git(true);
         match failure {
             Some(f) => self.error(format!("trashed {done} of {}: {f}", paths.len())),
-            None => self.success(format!("moved {} to the trash · u to undo", count(done))),
+            None => self.success(format!("moved {} to the Trash, u to undo", count(done))),
         }
     }
 
@@ -2104,7 +2104,7 @@ mod tests {
         assert!(tmp.path().join("READ_ME.md").exists());
         assert!(!tmp.path().join("README.md").exists());
         assert!(app.marked.is_empty());
-        assert_eq!(app.message().unwrap().text, "renamed 1 item · u to undo");
+        assert_eq!(app.message().unwrap().text, "renamed 1 item, u to undo");
         assert!(!list.exists(), "the list is cleaned up");
     }
 

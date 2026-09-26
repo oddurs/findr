@@ -15,6 +15,10 @@ pub struct Config {
     pub glyphs: Option<Tier>,
     pub mouse: bool,
     pub light: bool,
+    /// A second row of key hints at the bottom.
+    pub hints: bool,
+    /// `4 of 10` on the bottom bar.
+    pub position: bool,
 }
 
 impl Default for Config {
@@ -23,6 +27,8 @@ impl Default for Config {
             glyphs: None,
             mouse: true,
             light: false,
+            hints: false,
+            position: true,
         }
     }
 }
@@ -85,6 +91,8 @@ pub fn parse(text: &str) -> Result<Config, String> {
                 }
             }
             "mouse" => config.mouse = boolean(n, value)?,
+            "hints" => config.hints = boolean(n, value)?,
+            "position" => config.position = boolean(n, value)?,
             other => return Err(format!("{n}: unknown setting `{other}`")),
         }
     }
@@ -133,7 +141,7 @@ mod tests {
     #[test]
     fn reads_every_setting() {
         let config = parse(
-            "glyphs = \"ascii\"   # for a serial console\ntheme = \"light\"\nmouse = false\n",
+            "glyphs = \"ascii\"   # for a serial console\ntheme = \"light\"\nmouse = false\nhints = true\nposition = false\n",
         )
         .unwrap();
         assert_eq!(
@@ -142,6 +150,8 @@ mod tests {
                 glyphs: Some(Tier::Ascii),
                 mouse: false,
                 light: true,
+                hints: true,
+                position: false,
             }
         );
         assert_eq!(parse("glyphs = \"auto\"").unwrap().glyphs, None);
