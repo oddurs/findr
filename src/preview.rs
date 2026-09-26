@@ -46,9 +46,10 @@ pub enum Preview {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DiffLine {
     Hunk(String),
-    Added(String),
-    Removed(String),
-    Context(String),
+    /// The code of each line, without its `+`, `-` or space, highlighted like the file.
+    Added(Line<'static>),
+    Removed(Line<'static>),
+    Context(Line<'static>),
 }
 
 /// What a preview is of: a path, and whether it shows the file's diff instead of its content.
@@ -96,7 +97,7 @@ pub fn spawn() -> (Sender<Request>, Receiver<Response>) {
 fn build(req: &Request, highlighter: &mut Option<Highlighter>) -> Preview {
     let path = &req.key.path;
     if req.key.diff {
-        return diff(path).unwrap_or_else(|e| Preview::Note(format!("git diff: {e}")));
+        return diff(path, highlighter).unwrap_or_else(|e| Preview::Note(format!("git diff: {e}")));
     }
     let meta = match fs::metadata(path) {
         Ok(meta) => meta,
@@ -139,7 +140,7 @@ fn build(req: &Request, highlighter: &mut Option<Highlighter>) -> Preview {
 
 /// The file's changes against HEAD, staged or not. In a repository with no commits yet there
 /// is no HEAD, so it falls back to the unstaged changes.
-fn diff(path: &Path) -> io::Result<Preview> {
+fn diff(path: &Path, highlighter: &mut Option<Highlighter>) -> io::Result<Preview> {
     let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
         return Err(io::Error::other("no file name"));
     };
@@ -169,11 +170,17 @@ fn diff(path: &Path) -> io::Result<Preview> {
     if text.trim().is_empty() {
         return Ok(Preview::Note("no changes against HEAD".into()));
     }
+    let highlighter = highlighter.get_or_insert_with(Highlighter::new);
+    let first_code = text
+        .lines()
+        .find(|l| l.starts_with([' ', '+', '-']))
+        .unwrap_or("");
+    let syntax = highlighter.syntax_for(path, first_code.get(1..).unwrap_or(""));
+    let mut state = HighlightLines::new(syntax, &highlighter.theme);
     let (mut added, mut removed) = (0, 0);
     let mut lines = Vec::new();
     let mut in_hunks = false;
     for raw in text.lines() {
-        let line = clean(raw, &mut 0);
         // Everything before the first hunk is the file header (diff --git, index, ---, +++),
         // naming what the inspector's title already names. Only its position identifies it: a
         // removed SQL comment is also a line starting "--- ".
@@ -183,16 +190,22 @@ fn diff(path: &Path) -> io::Result<Preview> {
             }
             in_hunks = true;
         }
-        let kind = if raw.starts_with("@@") {
-            DiffLine::Hunk(line)
-        } else if raw.starts_with('+') {
+        if raw.starts_with("@@") {
+            // A hunk starts mid-file; highlighting state from the previous one would be a guess.
+            state = HighlightLines::new(syntax, &highlighter.theme);
+            lines.push(DiffLine::Hunk(clean(raw, &mut 0)));
+            continue;
+        }
+        let code = format!("{}\n", raw.get(1..).unwrap_or(""));
+        let code = Line::from(highlighter.spans(&mut state, &code));
+        let kind = if raw.starts_with('+') {
             added += 1;
-            DiffLine::Added(line)
+            DiffLine::Added(code)
         } else if raw.starts_with('-') {
             removed += 1;
-            DiffLine::Removed(line)
+            DiffLine::Removed(code)
         } else {
-            DiffLine::Context(line)
+            DiffLine::Context(code)
         };
         // Counted in full, shown up to the cap: the totals should not lie about a long diff.
         if lines.len() < MAX_LINES {
@@ -239,6 +252,25 @@ impl Highlighter {
             .unwrap_or_else(|| s.find_syntax_plain_text())
     }
 
+    /// One line of code as styled spans, advancing `state` past it.
+    fn spans(&self, state: &mut HighlightLines, line: &str) -> Vec<Span<'static>> {
+        // Tab stops depend on everything before them on the line, across spans.
+        let mut column = 0;
+        let ranges = if line.len() > MAX_HIGHLIGHT_LINE {
+            None
+        } else {
+            // A grammar that trips on a line leaves that line plain rather than losing the file.
+            state.highlight_line(line, &self.syntaxes).ok()
+        };
+        match ranges {
+            Some(ranges) => ranges
+                .into_iter()
+                .map(|(style, piece)| Span::styled(clean(piece, &mut column), convert(style)))
+                .collect(),
+            None => vec![Span::raw(clean(line, &mut column))],
+        }
+    }
+
     /// The highlighted lines and the name of the grammar used.
     fn highlight(&self, path: &Path, text: &str) -> (Vec<Line<'static>>, String) {
         let lines: Vec<&str> = LinesWithEndings::from(text).take(MAX_LINES).collect();
@@ -252,20 +284,7 @@ impl Highlighter {
             .enumerate()
             .map(|(i, line)| {
                 let mut spans = vec![Span::styled(format!("{:>width$} ", i + 1), gutter)];
-                // Tab stops depend on everything before them on the line, across spans.
-                let mut column = 0;
-                let ranges = if line.len() > MAX_HIGHLIGHT_LINE {
-                    None
-                } else {
-                    // A grammar that trips on a line leaves that line plain rather than losing the file.
-                    state.highlight_line(line, &self.syntaxes).ok()
-                };
-                match ranges {
-                    Some(ranges) => spans.extend(ranges.into_iter().map(|(style, piece)| {
-                        Span::styled(clean(piece, &mut column), convert(style))
-                    })),
-                    None => spans.push(Span::raw(clean(line, &mut column))),
-                }
+                spans.extend(self.spans(&mut state, line));
                 Line::from(spans)
             })
             .collect();
@@ -397,6 +416,16 @@ mod tests {
         assert_eq!(names, ["a", "b"]);
     }
 
+    /// A diff line as git printed it: its marker, then the code.
+    fn diff_text(line: &DiffLine) -> String {
+        match line {
+            DiffLine::Hunk(t) => t.clone(),
+            DiffLine::Added(l) => format!("+{}", text(l)),
+            DiffLine::Removed(l) => format!("-{}", text(l)),
+            DiffLine::Context(l) => format!(" {}", text(l)),
+        }
+    }
+
     fn git(dir: &Path, args: &[&str]) {
         let mut cmd = Command::new("git");
         for var in git::REPO_ENV {
@@ -436,8 +465,16 @@ mod tests {
             panic!("expected a diff");
         };
         assert_eq!((added, removed), (2, 1));
-        assert!(lines.contains(&DiffLine::Removed("-two".into())));
-        assert!(lines.contains(&DiffLine::Added("+four".into())));
+        let shown: Vec<String> = lines.iter().map(diff_text).collect();
+        assert!(shown.contains(&"-two".to_string()), "{shown:?}");
+        assert!(shown.contains(&"+four".to_string()), "{shown:?}");
+        let Some(DiffLine::Added(four)) = lines.iter().find(|l| diff_text(l) == "+four") else {
+            panic!("expected an added line");
+        };
+        assert!(
+            four.spans.iter().any(|s| s.style.fg.is_some()),
+            "code is highlighted"
+        );
         assert!(
             matches!(lines[0], DiffLine::Hunk(_)),
             "headers are skipped: {lines:?}"
@@ -464,14 +501,9 @@ mod tests {
             panic!("expected a diff");
         };
         assert_eq!((added, removed), (1, 1));
-        assert!(
-            lines.contains(&DiffLine::Removed("--- note".into())),
-            "{lines:?}"
-        );
-        assert!(
-            lines.contains(&DiffLine::Added("+++ added".into())),
-            "{lines:?}"
-        );
+        let shown: Vec<String> = lines.iter().map(diff_text).collect();
+        assert!(shown.contains(&"--- note".to_string()), "{shown:?}");
+        assert!(shown.contains(&"+++ added".to_string()), "{shown:?}");
 
         git(tmp.path(), &["checkout", "--", "lib.rs"]);
         assert!(matches!(build(&req, &mut None), Preview::Note(n) if n.contains("no changes")));

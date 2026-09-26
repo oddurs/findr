@@ -116,10 +116,14 @@ and those have a light variant.
 | `muted` | dark grey | dark grey | See *Emphasis* |
 | `surface.selected` | grey 237 | grey 253 | The cursor row |
 | `surface.context` | grey 236 | grey 254 | The current directory in the context column |
+| `surface.added` | green 22 | green 194 | The wash behind an added diff line |
+| `surface.removed` | red 52 | red 224 | The wash behind a removed diff line |
 
 Git status maps onto the semantic roles: modified → warning, added → success, deleted and
 conflicted → danger, renamed → info, untracked → danger (lighter), ignored → muted. A diff uses
-the same roles: added lines success, removed lines danger, hunk headers info.
+the same roles: the `+` and `-` markers success and danger, each changed line washed with
+`surface.added` or `surface.removed` to the edge, hunk headers info. The code itself keeps
+its syntax colours, so a diff reads like the file.
 
 ## Components
 

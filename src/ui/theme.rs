@@ -33,6 +33,9 @@ pub struct Theme {
     pub on_badge: Color,
     pub selected_bg: Color,
     pub context_bg: Color,
+    /// Faint washes behind added and removed lines of a diff, so the code keeps its colours.
+    pub added_bg: Color,
+    pub removed_bg: Color,
 }
 
 /// The tones a badge, chip or message can take.
@@ -66,6 +69,8 @@ impl Theme {
         on_badge: Color::Black,
         selected_bg: Color::Indexed(237),
         context_bg: Color::Indexed(236),
+        added_bg: Color::Indexed(22),
+        removed_bg: Color::Indexed(52),
     };
 
     pub const LIGHT: Theme = Theme {
@@ -74,6 +79,8 @@ impl Theme {
         on_badge: Color::White,
         selected_bg: Color::Indexed(253),
         context_bg: Color::Indexed(254),
+        added_bg: Color::Indexed(194),
+        removed_bg: Color::Indexed(224),
         ..Theme::DARK
     };
 
