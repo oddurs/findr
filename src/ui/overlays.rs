@@ -123,7 +123,7 @@ pub(super) fn draw_find(
     }
 
     let count = match &finder.index {
-        _ if finder.indexing() => "indexing…".to_string(),
+        None if finder.indexing() => "indexing…".to_string(),
         Some(index) => {
             // Only the best FIND_LIMIT are kept, so a full list means there were more.
             let capped = if finder.matches.len() >= FIND_LIMIT {
