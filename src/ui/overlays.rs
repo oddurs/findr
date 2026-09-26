@@ -34,6 +34,7 @@ pub(super) const HELP: &[Help] = &[
     Help::Key("space", "mark"),
     Help::Key("y x p", "copy, cut, paste"),
     Help::Key("d", "move to trash"),
+    Help::Key("u", "undo the last trash"),
     Help::Key("r", "rename; marked: all, in $EDITOR"),
     Help::Key("a A", "new file or path, new dir"),
     Help::Key("c", "copy path to clipboard"),

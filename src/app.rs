@@ -287,6 +287,8 @@ pub struct App {
     pub clip: Option<Clip>,
     pub job: Option<Job>,
     bulk: Option<BulkRename>,
+    /// What each trash action moved, as (original, where it went), for undo. Newest last.
+    trashed: Vec<Vec<(PathBuf, PathBuf)>>,
     /// Recent find indexes by (show_hidden, root), newest first.
     find_cache: Vec<(bool, Arc<find::Index>)>,
     pub git: Option<Repo>,
@@ -344,6 +346,7 @@ impl App {
             clip: None,
             job: None,
             bulk: None,
+            trashed: Vec::new(),
             find_cache: Vec::new(),
             git: None,
             message: None,
@@ -812,6 +815,7 @@ impl App {
             KeyCode::Char('y') => self.yank(false),
             KeyCode::Char('x') => self.yank(true),
             KeyCode::Char('p') => self.paste(),
+            KeyCode::Char('u') => self.undo_trash(),
             KeyCode::Char('d') => {
                 let targets = self.targets();
                 if !targets.is_empty() {
@@ -1321,12 +1325,12 @@ impl App {
         let Some(trash) = self.trash.clone() else {
             return self.error("no trash directory: HOME is not set");
         };
-        let mut done = 0;
+        let mut batch = Vec::new();
         let mut failure = None;
         for path in &paths {
             match trash.put(path) {
-                Ok(_) => {
-                    done += 1;
+                Ok(trashed) => {
+                    batch.push((path.clone(), trashed));
                     self.marked.remove(path);
                 }
                 Err(e) => {
@@ -1335,6 +1339,10 @@ impl App {
                 }
             }
         }
+        let done = batch.len();
+        if !batch.is_empty() {
+            self.trashed.push(batch);
+        }
         // The item under the cursor is gone; stay at the same row rather than jumping to the top.
         let row = self.selected;
         self.reload();
@@ -1342,7 +1350,38 @@ impl App {
         self.sync_git(true);
         match failure {
             Some(f) => self.error(format!("trashed {done} of {}: {f}", paths.len())),
-            None => self.success(format!("moved {} to the trash", count(done))),
+            None => self.success(format!("moved {} to the trash · u to undo", count(done))),
+        }
+    }
+
+    /// Puts the most recently trashed batch back.
+    fn undo_trash(&mut self) {
+        let (Some(trash), Some(batch)) = (self.trash.clone(), self.trashed.pop()) else {
+            return self.info("nothing to undo");
+        };
+        let total = batch.len();
+        let mut restored = Vec::new();
+        let mut failure = None;
+        for (original, trashed) in &batch {
+            match trash.restore(trashed, original) {
+                Ok(back) => restored.push(back),
+                Err(e) => {
+                    failure = Some(format!("{}: {e}", original.display()));
+                    break;
+                }
+            }
+        }
+        let select = restored
+            .iter()
+            .find(|p| p.parent() == Some(self.cwd.as_path()))
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().into_owned());
+        self.reload_selecting(select.or_else(|| self.selected().map(|e| e.name.clone())));
+        self.sync_git(true);
+        let done = restored.len();
+        match failure {
+            Some(f) => self.error(format!("restored {done} of {total}: {f}")),
+            None => self.success(format!("restored {}", count(done))),
         }
     }
 }
@@ -1554,6 +1593,29 @@ mod tests {
         assert!(tmp.path().join(".trash/README.md").exists());
         assert!(app.marked.is_empty());
         assert_eq!(names(&app), ["src"]);
+    }
+
+    #[test]
+    fn u_undoes_trash_one_batch_at_a_time() {
+        let (tmp, mut app) = setup();
+        press(&mut app, "j");
+        press(&mut app, "dy");
+        press(&mut app, "dy");
+        assert!(!tmp.path().join("Cargo.toml").exists());
+        assert!(!tmp.path().join("README.md").exists());
+        assert!(app.message().unwrap().text.ends_with("u to undo"));
+
+        press(&mut app, "u");
+        assert!(
+            tmp.path().join("README.md").exists(),
+            "the last batch comes back first"
+        );
+        assert!(!tmp.path().join("Cargo.toml").exists());
+        assert_eq!(app.selected().unwrap().name, "README.md");
+        press(&mut app, "u");
+        assert!(tmp.path().join("Cargo.toml").exists());
+        press(&mut app, "u");
+        assert_eq!(app.message().unwrap().text, "nothing to undo");
     }
 
     #[test]
