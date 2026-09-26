@@ -12,6 +12,7 @@ use syntect::easy::HighlightLines;
 use syntect::highlighting::{FontStyle, Theme, ThemeSet};
 use syntect::parsing::{SyntaxReference, SyntaxSet};
 use syntect::util::LinesWithEndings;
+use unicode_width::UnicodeWidthChar;
 
 use crate::dir::{self, Entry, SortKey};
 
@@ -143,6 +144,8 @@ impl Highlighter {
             .enumerate()
             .map(|(i, line)| {
                 let mut spans = vec![Span::styled(format!("{:>width$} ", i + 1), gutter)];
+                // Tab stops depend on everything before them on the line, across spans.
+                let mut column = 0;
                 let ranges = if line.len() > MAX_HIGHLIGHT_LINE {
                     None
                 } else {
@@ -150,12 +153,10 @@ impl Highlighter {
                     state.highlight_line(line, &self.syntaxes).ok()
                 };
                 match ranges {
-                    Some(ranges) => spans.extend(
-                        ranges
-                            .into_iter()
-                            .map(|(style, piece)| Span::styled(clean(piece), convert(style))),
-                    ),
-                    None => spans.push(Span::raw(clean(line))),
+                    Some(ranges) => spans.extend(ranges.into_iter().map(|(style, piece)| {
+                        Span::styled(clean(piece, &mut column), convert(style))
+                    })),
+                    None => spans.push(Span::raw(clean(line, &mut column))),
                 }
                 Line::from(spans)
             })
@@ -163,14 +164,27 @@ impl Highlighter {
     }
 }
 
-/// Makes text safe to put in terminal cells: no line endings, tabs expanded, control characters replaced.
-fn clean(s: &str) -> String {
+const TAB_WIDTH: usize = 4;
+
+/// Makes text safe to put in terminal cells: no line endings, tabs expanded to the next stop,
+/// control characters replaced. `column` is where `s` starts on the line, and is advanced past it.
+fn clean(s: &str, column: &mut usize) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.trim_end_matches(['\n', '\r']).chars() {
         match c {
-            '\t' => out.push_str("    "),
-            c if c.is_control() => out.push('·'),
-            c => out.push(c),
+            '\t' => {
+                let pad = TAB_WIDTH - *column % TAB_WIDTH;
+                out.extend(std::iter::repeat_n(' ', pad));
+                *column += pad;
+            }
+            c if c.is_control() => {
+                out.push('·');
+                *column += 1;
+            }
+            c => {
+                out.push(c);
+                *column += c.width().unwrap_or(0);
+            }
         }
     }
     out
@@ -251,6 +265,28 @@ mod tests {
 
     #[test]
     fn clean_strips_control_characters() {
-        assert_eq!(clean("a\tb\x1b[0m\r\n"), "a    b·[0m");
+        assert_eq!(clean("\tb\x1b[0m\r\n", &mut 0), "    b·[0m");
+    }
+
+    #[test]
+    fn tabs_expand_to_the_next_stop() {
+        assert_eq!(clean("a\tb", &mut 0), "a   b");
+        assert_eq!(clean("abcd\te", &mut 0), "abcd    e");
+        // The column carries across spans, as it does between highlighted pieces.
+        let mut column = 0;
+        let first = clean("ab", &mut column);
+        let second = clean("\tc", &mut column);
+        assert_eq!(format!("{first}{second}"), "ab  c");
+        assert_eq!(column, 5);
+    }
+
+    #[test]
+    fn highlighted_lines_keep_tab_alignment() {
+        let tmp = TempDir::new();
+        let Preview::Text(lines) = preview(tmp.file("Makefile", "a:\n\tb\nlong_name:\tc\n")) else {
+            panic!("expected text");
+        };
+        assert_eq!(text(&lines[1]), "2     b");
+        assert_eq!(text(&lines[2]), "3 long_name:  c");
     }
 }
