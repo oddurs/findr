@@ -8,6 +8,7 @@ use ratatui::widgets::{Clear, Paragraph};
 use unicode_width::UnicodeWidthStr;
 
 use super::components::panel;
+use super::glyphs::Tier;
 use super::rows::{Row, find_line};
 use super::theme::Theme;
 use crate::app::{FIND_LIMIT, Finder};
@@ -64,7 +65,7 @@ pub(super) fn draw_help(frame: &mut Frame, area: Rect, theme: &Theme) {
         .chunks(rows)
         .map(|column| {
             let keys = column.iter().map(|h| match h {
-                Help::Key(k, _) => k.width(),
+                Help::Key(k, _) => keys_as_typed(k, theme).width(),
                 Help::Section(_) => 0,
             });
             let keys = keys.max().unwrap_or(0);
@@ -92,7 +93,7 @@ pub(super) fn draw_help(frame: &mut Frame, area: Rect, theme: &Theme) {
                     )]
                 }
                 Help::Key(k, d) => vec![
-                    Span::styled(format!(" {k:<keys$}  "), key),
+                    Span::styled(format!(" {:<keys$}  ", keys_as_typed(k, theme)), key),
                     Span::raw(format!("{d:<w$} ", w = cell - keys - 4)),
                 ],
             });
@@ -105,13 +106,18 @@ pub(super) fn draw_help(frame: &mut Frame, area: Rect, theme: &Theme) {
     frame.render_widget(Paragraph::new(lines).block(panel("keys", theme)), popup);
 }
 
-pub(super) fn draw_find(
-    frame: &mut Frame,
-    finder: &Finder,
-    area: Rect,
-    icons: bool,
-    theme: &Theme,
-) {
+/// Arrow keys written as the terminal can show them.
+fn keys_as_typed(keys: &str, theme: &Theme) -> String {
+    if theme.glyphs.tier != Tier::Ascii {
+        return keys.to_string();
+    }
+    keys.replace('↑', "^")
+        .replace('↓', "v")
+        .replace('←', "<")
+        .replace('→', ">")
+}
+
+pub(super) fn draw_find(frame: &mut Frame, finder: &Finder, area: Rect, theme: &Theme) {
     let width = (area.width * 9 / 10).max(20);
     let height = (area.height * 8 / 10).max(5);
     let popup = centered(area, width, height);
@@ -124,7 +130,7 @@ pub(super) fn draw_find(
     }
 
     let count = match &finder.index {
-        None if finder.indexing() => "indexing…".to_string(),
+        None if finder.indexing() => format!("indexing{}", theme.glyphs.ellipsis),
         Some(index) => {
             // Only the best FIND_LIMIT are kept, so a full list means there were more.
             let capped = if finder.matches.len() >= FIND_LIMIT {
@@ -147,7 +153,10 @@ pub(super) fn draw_find(
     ])
     .areas(Rect { height: 1, ..inner });
     let prompt = Line::from(vec![
-        Span::styled(" › ", Style::new().fg(theme.accent)),
+        Span::styled(
+            format!(" {} ", theme.glyphs.prompt),
+            Style::new().fg(theme.accent),
+        ),
         Span::raw(finder.query.clone()),
     ]);
     frame.render_widget(Paragraph::new(prompt), prompt_area);
@@ -173,7 +182,6 @@ pub(super) fn draw_find(
         theme,
         width: rows.width as usize,
         size: false,
-        icons,
         muted: false,
     };
     let lines: Vec<Line> = finder

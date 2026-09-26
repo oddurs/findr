@@ -18,6 +18,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a status bar with the mode and anything pending; and a command line that shows the prompt,
   the latest outcome, or the keys that make sense for the selection.
 - A colour system by role, so each colour means one thing, and `--light` for light terminals.
+- Settings in `~/.config/findr/config.toml`: `glyphs`, `theme`, `mouse`.
+- Glyphs in three tiers — Nerd Font, Unicode, ASCII — chosen by what is installed and whether
+  the terminal is UTF-8, so the screen degrades instead of showing boxes.
 - Narrow terminals drop the parent column, then the preview, before squeezing the list.
 - Syntax-highlighted file previews in over 200 languages (bat's grammars), directory
   previews, and notes for binary and empty files.

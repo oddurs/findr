@@ -1,4 +1,5 @@
 mod app;
+mod config;
 mod dir;
 mod find;
 mod fuzzy;
@@ -22,6 +23,7 @@ use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{EnterAlternateScreen, enable_raw_mode};
 
 use app::{App, Effect};
+use ui::glyphs::{self, Glyphs, Tier};
 use ui::theme::Theme;
 
 const USAGE: &str = "\
@@ -112,7 +114,31 @@ fn main() -> ExitCode {
         icons,
         light,
     } = options;
-    let theme = if light { Theme::LIGHT } else { Theme::DARK };
+    let config = match config::load() {
+        Ok(config) => config,
+        Err(e) => {
+            eprintln!("findr: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    // Flags override the config file.
+    let mouse = mouse && config.mouse;
+    let base = if light || config.light {
+        Theme::LIGHT
+    } else {
+        Theme::DARK
+    };
+    let tier = config.glyphs.unwrap_or_else(glyphs::detect);
+    // --no-icons means no Nerd Font glyphs; it does not raise ASCII to Unicode.
+    let tier = if !icons && tier == Tier::Nerd {
+        Tier::Unicode
+    } else {
+        tier
+    };
+    let theme = Theme {
+        glyphs: Glyphs::for_tier(tier),
+        ..base
+    };
     let mut app = match App::new(&start, ops::Trash::detect()) {
         Ok(app) => app,
         Err(e) => {
@@ -120,7 +146,6 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    app.icons = icons;
 
     let mut terminal = ratatui::init();
     if mouse {

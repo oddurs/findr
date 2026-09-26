@@ -125,6 +125,19 @@ the same roles: the `+` and `-` markers success and danger, each changed line wa
 `surface.added` or `surface.removed` to the edge, hunk headers info. The code itself keeps
 its syntax colours, so a diff reads like the file.
 
+## Glyphs
+
+Symbols are tokens too, in `src/ui/glyphs.rs`, in three tiers so the screen degrades instead
+of showing boxes:
+
+| Tier | Chosen when | Draws |
+| --- | --- | --- |
+| Nerd | a Nerd Font is installed (or `glyphs = "nerd"`) | file icons, `` ``, the Unicode set |
+| Unicode | no Nerd Font (or `glyphs = "unicode"`, `--no-icons`) | `▌ ▍ ▐ … · › ✓ ✗ ● ↑ ↓ →`, rounded borders — all present in Menlo |
+| ASCII | the locale is not UTF-8 (or `glyphs = "ascii"`) | `> * # ~ - > ok ! * ^ v ->`, `+-|` borders |
+
+A view never writes a symbol itself; a test fails if one does, as it does for colours.
+
 ## Components
 
 Everything on screen is built from these, in `src/ui/components.rs`:
