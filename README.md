@@ -7,13 +7,18 @@ A terminal file browser for developers: Finder's column view, with git status,
 fuzzy filtering, and syntax-highlighted previews.
 
 ```
- ~/Code/findr/src  main*
- ? src/            │   app.rs                   36 K│   1 //! The preview column, built on a worker…
- ! target/         │ M dir.rs                   12 K│   2
-   Cargo.lock      │   fuzzy.rs                3.5 K│   3 use std::fs::{self, File};
-   Cargo.toml      │ ? preview.rs              8.2 K│   4 use std::io::Read;
- -rw-r--r--  8.2 K  19m ago                                                 name↓  8/9
+ ~/Code/findr/src                                                                    main ● ↑1
+   scripts/       │   fuzzy.rs                3.5 K │ preview.rs  Rust · 10 K
+ M src/           │ M git.rs                  9.0 K │   1 //! The preview column, built on a worker
+ ! target/        │   icons.rs                9.0 K▐│   2
+   Cargo.lock     │   main.rs                 7.7 K▐│   3 use std::fs::{self, File};
+   Cargo.toml     │   ops.rs                   11 K▐│   4 use std::io::Read;
+   CHANGELOG.md   │▌M preview.rs               10 K │   5 use std::path::{Path, PathBuf};
+ NORMAL  -rw-r--r--  10 K  1m ago                                                      name↓  10/11
+ ? help  f find  / filter  q quit
 ```
+
+(Shown with `--no-icons`; with a Nerd Font every entry has a file-type icon.)
 
 - **File-type icons** from a [Nerd Font](https://www.nerdfonts.com), coloured the way your
   editor colours them. `--no-icons` for a terminal without one.

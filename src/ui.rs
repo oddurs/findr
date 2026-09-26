@@ -8,7 +8,9 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use ratatui::widgets::{
+    Block, BorderType, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
+};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::{App, Areas, Confirm, FIND_LIMIT, Finder, Mode, parent_offset};
@@ -18,37 +20,52 @@ use crate::icons;
 use crate::preview::Preview;
 
 const SELECTED: Style = Style::new()
-    .bg(Color::Indexed(238))
+    .bg(Color::Indexed(237))
     .add_modifier(Modifier::BOLD);
 const PARENT_SELECTED: Style = Style::new().bg(Color::Indexed(236));
 const DIM: Style = Style::new().fg(Color::DarkGray);
+const ACCENT: Color = Color::Blue;
+/// Below this width the parent column goes; below the next, the preview does too.
+const WITH_PARENT: u16 = 90;
+const WITH_PREVIEW: u16 = 60;
 
-const HELP: &[(&str, &str)] = &[
-    ("j k  ↑ ↓", "move"),
-    ("h l  ← →", "parent / open"),
-    ("enter", "enter directory or edit file"),
-    ("gg G  ^d ^u", "top, bottom, half page"),
-    ("gh gr g/", "home, git root, filesystem root"),
-    ("-", "previous directory"),
-    (":", "go to a path"),
-    ("/", "fuzzy filter"),
-    ("f ^p", "find below (honours .gitignore)"),
-    ("esc", "clear filter, then marks"),
-    ("space", "mark"),
-    ("y x p", "copy, cut, paste"),
-    ("d", "move to trash"),
-    ("r", "rename"),
-    ("a A", "new file (a/b.rs makes dirs), new dir"),
-    ("e", "edit in $EDITOR"),
-    ("o", "open with the default app"),
-    ("c", "copy path to clipboard"),
-    ("!", "shell here"),
-    ("J K", "scroll preview"),
-    (".", "show hidden files"),
-    ("s S", "cycle sort, reverse"),
-    ("R", "reload"),
-    ("q Q", "quit and cd, quit"),
-    ("mouse", "wheel, click, double-click to open"),
+enum Help {
+    Section(&'static str),
+    Key(&'static str, &'static str),
+}
+
+const HELP: &[Help] = &[
+    Help::Section("Move"),
+    Help::Key("j k  ↑ ↓", "down, up"),
+    Help::Key("h l  ← →", "parent, open"),
+    Help::Key("enter", "enter directory or edit file"),
+    Help::Key("gg G  ^d ^u", "top, bottom, half page"),
+    Help::Key("gh gr g/", "home, git root, root"),
+    Help::Key("-", "previous directory"),
+    Help::Key(":", "go to a path"),
+    Help::Section("Find"),
+    Help::Key("/", "fuzzy filter this directory"),
+    Help::Key("f ^p", "find below, per .gitignore"),
+    Help::Key("esc", "clear filter, then marks"),
+    Help::Section("Files"),
+    Help::Key("space", "mark"),
+    Help::Key("y x p", "copy, cut, paste"),
+    Help::Key("d", "move to trash"),
+    Help::Key("r", "rename"),
+    Help::Key("a A", "new file or path, new dir"),
+    Help::Key("c", "copy path to clipboard"),
+    Help::Section("Open"),
+    Help::Key("e", "edit in $EDITOR"),
+    Help::Key("o", "open with the default app"),
+    Help::Key("!", "shell here"),
+    Help::Section("View"),
+    Help::Key("J K", "scroll preview"),
+    Help::Key(".", "show hidden files"),
+    Help::Key("s S", "cycle sort, reverse"),
+    Help::Key("R", "reload"),
+    Help::Key("mouse", "wheel, click, double-click"),
+    Help::Section("Quit"),
+    Help::Key("q Q", "quit and cd, quit"),
 ];
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
@@ -59,19 +76,33 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Constraint::Length(1),
     ])
     .areas(frame.area());
-    let [parent, current, preview] = Layout::horizontal([
-        Constraint::Percentage(20),
-        Constraint::Percentage(35),
-        Constraint::Percentage(45),
-    ])
-    .areas(body);
+    // Narrow terminals give up the parent column first, then the preview, so the list
+    // itself always keeps a usable width.
+    let widths = match body.width {
+        w if w >= WITH_PARENT => [18, 34, 48],
+        w if w >= WITH_PREVIEW => [0, 42, 58],
+        _ => [0, 100, 0],
+    };
+    let [parent, current, preview] =
+        Layout::horizontal(widths.map(Constraint::Percentage)).areas(body);
 
-    let current = column(frame, current);
-    let preview = column(frame, preview);
-    let preview = Rect {
-        x: preview.x + 1,
-        width: preview.width.saturating_sub(1),
-        ..preview
+    let current = if parent.width > 0 {
+        column(frame, current)
+    } else {
+        current
+    };
+    let (preview_title, preview) = if preview.width > 0 {
+        let inner = column(frame, preview);
+        let inner = Rect {
+            x: inner.x + 1,
+            width: inner.width.saturating_sub(1),
+            ..inner
+        };
+        let [title, rest] =
+            Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(inner);
+        (title, rest)
+    } else {
+        (Rect::default(), Rect::default())
     };
     // Recorded so a mouse click can be mapped back to the row under it.
     app.areas = Areas {
@@ -81,9 +112,14 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     };
 
     draw_header(frame, app, header);
-    draw_parent(frame, app, parent);
+    if parent.width > 0 {
+        draw_parent(frame, app, parent);
+    }
     draw_current(frame, app, current);
-    draw_preview(frame, app, preview);
+    if preview.width > 0 {
+        draw_preview_title(frame, app, preview_title);
+        draw_preview(frame, app, preview);
+    }
     draw_status(frame, app, status);
     draw_command(frame, app, command);
     match &app.mode {
@@ -101,27 +137,54 @@ fn column(frame: &mut Frame, area: Rect) -> Rect {
 }
 
 fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
-    let mut spans = vec![Span::styled(
-        format!(" {}", tildify(&app.cwd)),
-        Style::new().fg(Color::Blue).add_modifier(Modifier::BOLD),
-    )];
-    if let Some(repo) = &app.git {
-        let branch = repo.branch.as_deref().unwrap_or("?");
-        spans.push(Span::styled(
-            format!("  {branch}"),
-            Style::new().fg(Color::Magenta),
-        ));
-        if repo.is_dirty() {
-            spans.push(Span::styled("*", Style::new().fg(Color::Yellow)));
-        }
-    }
+    // The path dim up to the last segment, which is where you are.
+    let path = tildify(&app.cwd);
+    let (dir, here) = match path.rsplit_once('/') {
+        Some((dir, here)) if !here.is_empty() => (format!("{dir}/"), here.to_string()),
+        _ => (String::new(), path),
+    };
+    let left = Line::from(vec![
+        Span::raw(" "),
+        Span::styled(dir, Style::new().fg(ACCENT)),
+        Span::styled(here, Style::new().fg(ACCENT).add_modifier(Modifier::BOLD)),
+    ]);
+
+    let mut right = Vec::new();
     if !app.filter.is_empty() && !matches!(app.mode, Mode::Filter) {
-        spans.push(Span::styled(
-            format!("  /{}", app.filter),
+        right.push(Span::styled(
+            format!("/{}  ", app.filter),
             Style::new().fg(Color::Yellow),
         ));
     }
-    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    if let Some(repo) = &app.git {
+        let icon = if app.icons { "\u{e725} " } else { "" };
+        let branch = repo.branch.as_deref().unwrap_or("?");
+        right.push(Span::styled(
+            format!("{icon}{branch}"),
+            Style::new().fg(Color::Magenta),
+        ));
+        if repo.is_dirty() {
+            right.push(Span::styled(" ●", Style::new().fg(Color::Yellow)));
+        }
+        if repo.ahead > 0 {
+            right.push(Span::styled(
+                format!(" ↑{}", repo.ahead),
+                Style::new().fg(Color::Green),
+            ));
+        }
+        if repo.behind > 0 {
+            right.push(Span::styled(
+                format!(" ↓{}", repo.behind),
+                Style::new().fg(Color::Red),
+            ));
+        }
+        right.push(Span::raw(" "));
+    }
+    let right = Line::from(right);
+    let [l, r] = Layout::horizontal([Constraint::Min(0), Constraint::Length(right.width() as u16)])
+        .areas(area);
+    frame.render_widget(Paragraph::new(left), l);
+    frame.render_widget(Paragraph::new(right), r);
 }
 
 fn tildify(path: &Path) -> String {
@@ -164,9 +227,9 @@ fn draw_current(frame: &mut Frame, app: &mut App, inner: Rect) {
     app.page = height;
     if app.view.is_empty() {
         let note = if app.filter.is_empty() {
-            " empty"
+            "  empty directory".to_string()
         } else {
-            " no matches"
+            format!("  nothing matches /{}", app.filter)
         };
         frame.render_widget(Paragraph::new(Span::styled(note, DIM)), inner);
         return;
@@ -179,30 +242,82 @@ fn draw_current(frame: &mut Frame, app: &mut App, inner: Rect) {
     }
     app.offset = app.offset.min(app.view.len().saturating_sub(height));
 
-    let width = inner.width as usize;
+    // A scrollbar only when there is somewhere to scroll, and then the rows give up a column.
+    let overflow = app.view.len() > height;
+    let width = inner.width as usize - usize::from(overflow);
     let lines: Vec<Line> = app.view[app.offset..]
         .iter()
         .take(height)
         .enumerate()
         .map(|(i, v)| {
             let e = &app.entries[v.idx];
-            let line = entry_line(
-                e,
-                &v.hits,
-                status(app.git.as_ref(), e),
-                app.marked.contains(&e.path),
-                width,
-                true,
-                app.icons,
-            );
-            if app.offset + i == app.selected {
-                line.patch_style(SELECTED)
-            } else {
-                line
+            let marked = app.marked.contains(&e.path);
+            let status = status(app.git.as_ref(), e);
+            let mut line = entry_line(e, &v.hits, status, marked, width, true, app.icons);
+            if app.offset + i != app.selected {
+                return line;
             }
+            // The cursor row carries an accent bar in the mark column, unless it is marked.
+            if !marked {
+                line.spans[0] = Span::styled("▌", Style::new().fg(ACCENT));
+            }
+            line.patch_style(SELECTED)
         })
         .collect();
     frame.render_widget(Paragraph::new(lines), inner);
+    if overflow {
+        let mut state = ScrollbarState::new(app.view.len() - height + 1)
+            .viewport_content_length(height)
+            .position(app.offset);
+        let bar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(None)
+            .end_symbol(None)
+            .track_symbol(None)
+            .thumb_symbol("▐")
+            .thumb_style(DIM);
+        frame.render_stateful_widget(bar, inner, &mut state);
+    }
+}
+
+/// What the preview is of: the entry's icon and name, then a dim summary.
+fn draw_preview_title(frame: &mut Frame, app: &App, area: Rect) {
+    let Some(entry) = app.selected() else {
+        return;
+    };
+    let mut spans = Vec::new();
+    if app.icons {
+        let icon = icons::for_entry(entry);
+        spans.push(Span::styled(
+            format!("{} ", icon.glyph),
+            Style::new().fg(icon.color),
+        ));
+    }
+    spans.push(Span::styled(
+        entry.name.clone(),
+        name_style(entry, None).add_modifier(Modifier::BOLD),
+    ));
+    let preview = app.preview.as_ref().filter(|(p, _)| *p == entry.path);
+    let summary = match preview.map(|(_, p)| p) {
+        Some(Preview::Dir(entries)) => match entries.len() {
+            1 => "1 item".to_string(),
+            n => format!("{n} items"),
+        },
+        Some(Preview::Text {
+            syntax, truncated, ..
+        }) => {
+            let mut s = format!("{syntax} · {}", dir::human_size(entry.size));
+            if *truncated {
+                s.push_str(" · showing the start");
+            }
+            s
+        }
+        Some(Preview::Note(note)) => note.clone(),
+        None => String::new(),
+    };
+    if !summary.is_empty() {
+        spans.push(Span::styled(format!("  {summary}"), DIM));
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 fn draw_preview(frame: &mut Frame, app: &App, inner: Rect) {
@@ -214,30 +329,24 @@ fn draw_preview(frame: &mut Frame, app: &App, inner: Rect) {
     };
     let height = inner.height as usize;
     let lines: Vec<Line> = match preview {
-        Preview::Dir(entries) if entries.is_empty() => vec![Line::styled("empty", DIM)],
+        Preview::Dir(entries) if entries.is_empty() => vec![Line::styled("empty directory", DIM)],
         Preview::Dir(entries) => entries
             .iter()
             .skip(app.preview_scroll)
             .take(height)
             .map(|e| {
-                entry_line(
-                    e,
-                    &[],
-                    status(app.git.as_ref(), e),
-                    false,
-                    inner.width as usize,
-                    true,
-                    app.icons,
-                )
+                let status = status(app.git.as_ref(), e);
+                entry_line(e, &[], status, false, inner.width as usize, true, app.icons)
             })
             .collect(),
-        Preview::Text(lines) => lines
+        Preview::Text { lines, .. } => lines
             .iter()
             .skip(app.preview_scroll)
             .take(height)
             .cloned()
             .collect(),
-        Preview::Note(note) => vec![Line::styled(note.clone(), DIM)],
+        // Already said in the title.
+        Preview::Note(_) => Vec::new(),
     };
     frame.render_widget(Paragraph::new(lines), inner);
 }
@@ -370,56 +479,101 @@ fn push_name(
 }
 
 fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
-    let mut left = String::from(" ");
+    let (label, color) = match &app.mode {
+        Mode::Normal => ("NORMAL", ACCENT),
+        Mode::Filter => ("FILTER", Color::Yellow),
+        Mode::Find(_) => ("FIND", Color::Magenta),
+        Mode::Input(_) => ("INPUT", Color::Cyan),
+        Mode::Confirm(_) => ("CONFIRM", Color::Red),
+        Mode::Goto => ("GO", Color::Cyan),
+        Mode::Help => ("HELP", Color::Green),
+    };
+    let badge = Style::new()
+        .fg(Color::Black)
+        .bg(color)
+        .add_modifier(Modifier::BOLD);
+    let mut left = vec![Span::styled(format!(" {label} "), badge), Span::raw(" ")];
     if let Some(e) = app.selected() {
-        left.push_str(&dir::mode_string(e));
+        left.extend(permission_spans(&dir::mode_string(e)));
         if !e.is_dir {
-            left.push_str(&format!("  {}", dir::human_size(e.size)));
+            left.push(Span::raw(format!("  {}", dir::human_size(e.size))));
         }
         if let Some(t) = e.modified {
-            left.push_str(&format!("  {}", dir::fmt_age(t, SystemTime::now())));
+            left.push(Span::styled(
+                format!("  {}", dir::fmt_age(t, SystemTime::now())),
+                DIM,
+            ));
         }
         if e.is_symlink
             && let Ok(target) = std::fs::read_link(&e.path)
         {
-            left.push_str(&format!("  → {}", target.display()));
+            left.push(Span::styled(
+                format!("  → {}", target.display()),
+                Style::new().fg(Color::Cyan),
+            ));
         }
     }
 
+    let sep = || Span::styled("  ", DIM);
     let mut right = Vec::new();
     if !app.marked.is_empty() {
-        right.push(format!("{} marked", app.marked.len()));
+        right.push(Span::styled(
+            format!("▍{} marked", app.marked.len()),
+            Style::new().fg(Color::Magenta),
+        ));
+        right.push(sep());
     }
     if let Some(job) = &app.job {
-        right.push(format!("pasting {}/{}", job.done, job.total));
+        right.push(Span::styled(
+            format!("pasting {}/{}", job.done, job.total),
+            Style::new().fg(Color::Cyan),
+        ));
+        right.push(sep());
     }
     if let Some(clip) = &app.clip {
-        right.push(format!(
-            "{} {}",
-            clip.paths.len(),
-            if clip.cut { "cut" } else { "copied" }
+        let verb = if clip.cut { "cut" } else { "copied" };
+        right.push(Span::styled(
+            format!("{} {verb}", clip.paths.len()),
+            Style::new().fg(Color::Yellow),
         ));
+        right.push(sep());
     }
     if app.show_hidden {
-        right.push("hidden".into());
+        right.push(Span::styled("hidden", DIM));
+        right.push(sep());
     }
-    right.push(format!(
-        "{}{}",
-        app.sort.label(),
-        if app.reverse { "↑" } else { "↓" }
-    ));
+    let arrow = if app.reverse { "↑" } else { "↓" };
+    right.push(Span::styled(format!("{}{arrow}", app.sort.label()), DIM));
+    right.push(sep());
     let position = if app.view.is_empty() {
         0
     } else {
         app.selected + 1
     };
-    right.push(format!("{position}/{}", app.view.len()));
-    let right = format!("{} ", right.join("  "));
+    right.push(Span::raw(format!("{position}/{} ", app.view.len())));
 
+    let right = Line::from(right);
     let [l, r] = Layout::horizontal([Constraint::Min(0), Constraint::Length(right.width() as u16)])
         .areas(area);
-    frame.render_widget(Paragraph::new(Span::styled(left, DIM)), l);
-    frame.render_widget(Paragraph::new(Span::styled(right, DIM)), r);
+    frame.render_widget(Paragraph::new(Line::from(left)), l);
+    frame.render_widget(Paragraph::new(right), r);
+}
+
+/// `drwxr-xr-x` coloured the way `ls` users read it: type, then read, write, execute.
+fn permission_spans(mode: &str) -> Vec<Span<'static>> {
+    mode.chars()
+        .map(|c| {
+            let color = match c {
+                'd' => ACCENT,
+                'l' => Color::Cyan,
+                'r' => Color::Yellow,
+                'w' => Color::Red,
+                'x' => Color::Green,
+                _ => Color::DarkGray,
+            };
+            Span::styled(c.to_string(), Style::new().fg(color))
+        })
+        .collect()
 }
 
 fn draw_command(frame: &mut Frame, app: &App, area: Rect) {
@@ -476,10 +630,10 @@ fn draw_command(frame: &mut Frame, app: &App, area: Rect) {
         Mode::Normal | Mode::Help => {
             let line = match app.message() {
                 Some(m) if m.error => {
-                    Span::styled(format!(" {}", m.text), Style::new().fg(Color::Red))
+                    Span::styled(format!(" ✗ {}", m.text), Style::new().fg(Color::Red))
                 }
                 Some(m) => Span::raw(format!(" {}", m.text)),
-                None => Span::styled(" ? help", DIM),
+                None => Span::styled(" ? help  f find  / filter  q quit", DIM),
             };
             frame.render_widget(Paragraph::new(line), area);
         }
@@ -487,32 +641,64 @@ fn draw_command(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_help(frame: &mut Frame, area: Rect) {
-    let keys_width = HELP.iter().map(|(k, _)| k.width()).max().unwrap_or(0);
-    let desc_width = HELP.iter().map(|(_, d)| d.width()).max().unwrap_or(0);
     // Flow into more columns when the terminal is too short for one.
     let rows = (area.height.saturating_sub(2) as usize).max(1);
     let columns = HELP.len().div_ceil(rows);
     let rows = HELP.len().div_ceil(columns);
+    // Each column is as wide as its own contents, so a column of short entries does not
+    // take the room a long one needs.
+    let widths: Vec<(usize, usize)> = HELP
+        .chunks(rows)
+        .map(|column| {
+            let keys = column.iter().map(|h| match h {
+                Help::Key(k, _) => k.width(),
+                Help::Section(_) => 0,
+            });
+            let keys = keys.max().unwrap_or(0);
+            let cells = column.iter().map(|h| match h {
+                Help::Key(_, d) => keys + d.width() + 4,
+                Help::Section(s) => s.width() + 2,
+            });
+            (keys, cells.max().unwrap_or(0))
+        })
+        .collect();
+    let heading = Style::new().fg(ACCENT).add_modifier(Modifier::BOLD);
     let lines: Vec<Line> = (0..rows)
         .map(|r| {
-            let cells = (0..columns).filter_map(|c| HELP.get(c * rows + r));
-            let spans = cells.flat_map(|(k, d)| {
-                [
-                    Span::styled(
-                        format!(" {k:<keys_width$}  "),
-                        Style::new().fg(Color::Yellow),
-                    ),
-                    Span::raw(format!("{d:<desc_width$} ")),
-                ]
+            let cells = widths
+                .iter()
+                .enumerate()
+                .filter_map(|(c, &(keys, cell))| Some((HELP.get(c * rows + r)?, keys, cell)));
+            let spans = cells.flat_map(|(h, keys, cell)| match h {
+                Help::Section(title) => {
+                    vec![Span::styled(
+                        format!(" {title:<w$} ", w = cell - 2),
+                        heading,
+                    )]
+                }
+                Help::Key(k, d) => vec![
+                    Span::styled(format!(" {k:<keys$}  "), Style::new().fg(Color::Yellow)),
+                    Span::raw(format!("{d:<w$} ", w = cell - keys - 4)),
+                ],
             });
             Line::from(spans.collect::<Vec<_>>())
         })
         .collect();
-    let width = (columns * (keys_width + desc_width + 4)) as u16 + 2;
+    let width = widths.iter().map(|(_, cell)| cell).sum::<usize>() as u16 + 2;
     let popup = centered(area, width, rows as u16 + 2);
     frame.render_widget(Clear, popup);
-    let block = Block::bordered().title(" findr ").border_style(DIM);
-    frame.render_widget(Paragraph::new(lines).block(block), popup);
+    frame.render_widget(Paragraph::new(lines).block(popup_block(" keys ")), popup);
+}
+
+/// The frame every overlay shares.
+fn popup_block(title: &str) -> Block<'static> {
+    Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(DIM)
+        .title(Span::styled(
+            title.to_string(),
+            Style::new().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ))
 }
 
 fn draw_find(frame: &mut Frame, finder: &Finder, area: Rect, icons: bool) {
@@ -520,7 +706,7 @@ fn draw_find(frame: &mut Frame, finder: &Finder, area: Rect, icons: bool) {
     let height = (area.height * 8 / 10).max(5);
     let popup = centered(area, width, height);
     frame.render_widget(Clear, popup);
-    let block = Block::bordered().title(" find ").border_style(DIM);
+    let block = popup_block(" find ");
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
     if inner.height < 2 {
@@ -709,13 +895,15 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
 
-        let screen = render(&mut app, 80, 8);
+        let screen = render(&mut app, 100, 8);
         let rows: Vec<&str> = screen.lines().collect();
         // The header holds the temp path and the parent column lists whatever else is in the
         // temp dir, so the snapshot takes the body right of the parent column plus the bottom bars.
+        let parent = app.areas.parent.width as usize;
+        assert!(parent > 0, "wide enough for the parent column");
         let body = rows[1..rows.len() - 2]
             .iter()
-            .map(|r| r.chars().skip(16).collect::<String>());
+            .map(|r| r.chars().skip(parent).collect::<String>());
         let snapshot: Vec<String> = body
             .chain(rows[rows.len() - 2..].iter().map(|r| r.to_string()))
             .collect();
@@ -761,14 +949,41 @@ mod tests {
         let tmp = TempDir::new();
         let mut app = App::new(tmp.path(), None).unwrap();
         app.mode = Mode::Help;
-        for (width, height) in [(120, 40), (120, 24), (220, 12)] {
+        for (width, height) in [(120, 40), (120, 24), (120, 16), (200, 12)] {
             let screen = render(&mut app, width, height);
-            for (_, desc) in HELP {
+            for line in HELP {
+                let (Help::Key(_, text) | Help::Section(text)) = line;
                 assert!(
-                    screen.contains(desc),
-                    "{desc:?} missing at height {height}:\n{screen}"
+                    screen.contains(text),
+                    "{text:?} missing at {width}x{height}:\n{screen}"
                 );
             }
         }
+    }
+
+    #[test]
+    fn narrow_terminals_drop_the_parent_then_the_preview() {
+        let tmp = TempDir::new();
+        tmp.file("src/lib.rs", "");
+        let mut app = App::new(tmp.path(), None).unwrap();
+        render(&mut app, 120, 10);
+        assert!(app.areas.parent.width > 0 && app.areas.preview.width > 0);
+        render(&mut app, 70, 10);
+        assert_eq!(app.areas.parent.width, 0);
+        assert!(app.areas.preview.width > 0);
+        let screen = render(&mut app, 40, 10);
+        assert_eq!(app.areas.preview.width, 0);
+        assert!(screen.contains("src/"), "{screen}");
+    }
+
+    #[test]
+    fn permissions_are_coloured_by_meaning() {
+        let spans = permission_spans("drwxr-x---");
+        let color = |i: usize| spans[i].style.fg;
+        assert_eq!(color(0), Some(ACCENT));
+        assert_eq!(color(1), Some(Color::Yellow));
+        assert_eq!(color(2), Some(Color::Red));
+        assert_eq!(color(3), Some(Color::Green));
+        assert_eq!(color(9), Some(Color::DarkGray));
     }
 }

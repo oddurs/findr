@@ -36,6 +36,9 @@ impl Status {
 pub struct Repo {
     pub root: PathBuf,
     pub branch: Option<String>,
+    /// Commits the branch is ahead of and behind its upstream.
+    pub ahead: u32,
+    pub behind: u32,
     statuses: Vec<(String, Status)>,
 }
 
@@ -105,10 +108,12 @@ impl Repo {
             let err = String::from_utf8_lossy(&out.stderr);
             return Err(io::Error::other(err.trim().to_string()));
         }
-        let (branch, statuses) = parse_porcelain(&out.stdout);
+        let (head, statuses) = parse_porcelain(&out.stdout);
         Ok(Repo {
             root: root.to_path_buf(),
-            branch,
+            branch: head.branch,
+            ahead: head.ahead,
+            behind: head.behind,
             statuses,
         })
     }
@@ -146,16 +151,40 @@ fn is_under(path: &str, dir: &str) -> bool {
         .is_some_and(|rest| rest.starts_with('/'))
 }
 
-fn parse_porcelain(raw: &[u8]) -> (Option<String>, Vec<(String, Status)>) {
-    let mut branch = None;
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Head {
+    branch: Option<String>,
+    ahead: u32,
+    behind: u32,
+}
+
+/// Reads the `## branch...upstream [ahead 1, behind 2]` line.
+fn parse_head(head: &str) -> Head {
+    let head = head.strip_prefix("No commits yet on ").unwrap_or(head);
+    let name = head.split("...").next().unwrap_or(head);
+    let count = |label: &str| {
+        let (_, rest) = head.split_once(label)?;
+        rest.trim_start()
+            .split(|c: char| !c.is_ascii_digit())
+            .next()?
+            .parse()
+            .ok()
+    };
+    Head {
+        branch: name.split(' ').next().map(str::to_string),
+        ahead: count("ahead").unwrap_or(0),
+        behind: count("behind").unwrap_or(0),
+    }
+}
+
+fn parse_porcelain(raw: &[u8]) -> (Head, Vec<(String, Status)>) {
+    let mut head = Head::default();
     let mut statuses = Vec::new();
     let mut fields = raw.split(|b| *b == 0).filter(|f| !f.is_empty());
     while let Some(field) = fields.next() {
         let line = String::from_utf8_lossy(field);
-        if let Some(head) = line.strip_prefix("## ") {
-            let head = head.strip_prefix("No commits yet on ").unwrap_or(head);
-            let name = head.split("...").next().unwrap_or(head);
-            branch = name.split(' ').next().map(str::to_string);
+        if let Some(line) = line.strip_prefix("## ") {
+            head = parse_head(line);
             continue;
         }
         if field.len() < 4 {
@@ -178,7 +207,7 @@ fn parse_porcelain(raw: &[u8]) -> (Option<String>, Vec<(String, Status)>) {
         };
         statuses.push((path.trim_end_matches('/').to_string(), status));
     }
-    (branch, statuses)
+    (head, statuses)
 }
 
 #[cfg(test)]
@@ -187,10 +216,12 @@ mod tests {
 
     fn repo() -> Repo {
         let raw = b"## main...origin/main [ahead 1]\0 M src/app.rs\0?? notes/\0!! target/\0R  new.rs\0old.rs\0A  added.rs\0!! src/gen.rs\0UU both.rs\0";
-        let (branch, statuses) = parse_porcelain(raw);
+        let (head, statuses) = parse_porcelain(raw);
         Repo {
             root: PathBuf::from("/r"),
-            branch,
+            branch: head.branch,
+            ahead: head.ahead,
+            behind: head.behind,
             statuses,
         }
     }
@@ -206,8 +237,30 @@ mod tests {
 
     #[test]
     fn branch_before_first_commit() {
-        let (branch, _) = parse_porcelain(b"## No commits yet on trunk\0");
-        assert_eq!(branch.as_deref(), Some("trunk"));
+        let (head, _) = parse_porcelain(b"## No commits yet on trunk\0");
+        assert_eq!(head.branch.as_deref(), Some("trunk"));
+    }
+
+    #[test]
+    fn reads_ahead_and_behind() {
+        let head = |s| parse_head(s);
+        assert_eq!(
+            head("main...origin/main [ahead 2, behind 13]"),
+            Head {
+                branch: Some("main".into()),
+                ahead: 2,
+                behind: 13
+            }
+        );
+        assert_eq!(head("feat/x...origin/feat/x [behind 1]").behind, 1);
+        assert_eq!(
+            head("main...origin/main [gone]"),
+            Head {
+                branch: Some("main".into()),
+                ..Head::default()
+            }
+        );
+        assert_eq!(head("HEAD (no branch)").branch.as_deref(), Some("HEAD"));
     }
 
     #[test]
