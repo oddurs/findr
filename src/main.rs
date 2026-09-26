@@ -14,7 +14,9 @@ use std::process::{Command, ExitCode};
 use std::time::Duration;
 
 use ratatui::DefaultTerminal;
-use ratatui::crossterm::event::{self, Event, KeyEventKind};
+use ratatui::crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind,
+};
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{EnterAlternateScreen, enable_raw_mode};
 
@@ -23,10 +25,11 @@ use app::{App, Effect};
 const USAGE: &str = "\
 findr - a terminal file browser for developers
 
-usage: findr [PATH] [--cwd-file FILE]
+usage: findr [PATH] [--cwd-file FILE] [--no-mouse]
 
   PATH             directory to open, or a file to open with the cursor on it
   --cwd-file FILE  on quitting with q, write the final directory to FILE
+  --no-mouse       leave the mouse to the terminal, for selecting text
   -h, --help       show this help
   -V, --version    show the version
 
@@ -37,6 +40,7 @@ enum Cli {
     Run {
         start: PathBuf,
         cwd_file: Option<PathBuf>,
+        mouse: bool,
     },
     Help,
     Version,
@@ -45,11 +49,13 @@ enum Cli {
 fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Cli, String> {
     let mut start = None;
     let mut cwd_file = None;
+    let mut mouse = true;
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         match arg.to_str() {
             Some("-h" | "--help") => return Ok(Cli::Help),
             Some("-V" | "--version") => return Ok(Cli::Version),
+            Some("--no-mouse") => mouse = false,
             Some("--cwd-file") => {
                 cwd_file = Some(args.next().ok_or("--cwd-file needs a path")?.into())
             }
@@ -64,12 +70,17 @@ fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Cli, String> {
     Ok(Cli::Run {
         start: start.unwrap_or_else(|| PathBuf::from(".")),
         cwd_file,
+        mouse,
     })
 }
 
 fn main() -> ExitCode {
-    let (start, cwd_file) = match parse(std::env::args_os().skip(1)) {
-        Ok(Cli::Run { start, cwd_file }) => (start, cwd_file),
+    let (start, cwd_file, mouse) = match parse(std::env::args_os().skip(1)) {
+        Ok(Cli::Run {
+            start,
+            cwd_file,
+            mouse,
+        }) => (start, cwd_file, mouse),
         Ok(Cli::Help) => {
             println!("{USAGE}");
             return ExitCode::SUCCESS;
@@ -92,7 +103,20 @@ fn main() -> ExitCode {
     };
 
     let mut terminal = ratatui::init();
-    let result = run(&mut terminal, &mut app);
+    if mouse {
+        // ratatui's panic hook restores the screen but knows nothing of mouse capture, and a
+        // terminal left reporting mouse movement fills the shell with escape codes.
+        let restore = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            release_mouse();
+            restore(info);
+        }));
+        capture_mouse();
+    }
+    let result = run(&mut terminal, &mut app, mouse);
+    if mouse {
+        release_mouse();
+    }
     ratatui::restore();
 
     let write_cwd = match result {
@@ -112,7 +136,7 @@ fn main() -> ExitCode {
 }
 
 /// The event loop. Returns whether the final directory should be written for the shell.
-fn run(terminal: &mut DefaultTerminal, app: &mut App) -> io::Result<bool> {
+fn run(terminal: &mut DefaultTerminal, app: &mut App, mouse: bool) -> io::Result<bool> {
     let mut dirty = true;
     loop {
         app.sync_preview();
@@ -127,7 +151,15 @@ fn run(terminal: &mut DefaultTerminal, app: &mut App) -> io::Result<bool> {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
                     match app.handle_key(key) {
                         Some(Effect::Quit { write_cwd }) => return Ok(write_cwd),
-                        Some(Effect::Run(cmd)) => suspend(terminal, cmd, app)?,
+                        Some(Effect::Run(cmd)) => suspend(terminal, cmd, app, mouse)?,
+                        None => {}
+                    }
+                    dirty = true;
+                }
+                Event::Mouse(event) => {
+                    match app.handle_mouse(event) {
+                        Some(Effect::Quit { write_cwd }) => return Ok(write_cwd),
+                        Some(Effect::Run(cmd)) => suspend(terminal, cmd, app, mouse)?,
                         None => {}
                     }
                     dirty = true;
@@ -142,12 +174,33 @@ fn run(terminal: &mut DefaultTerminal, app: &mut App) -> io::Result<bool> {
     }
 }
 
+// Mouse capture is a nicety: if the terminal refuses it, findr still works from the keyboard,
+// so failures here are not worth stopping for.
+fn capture_mouse() {
+    let _ = execute!(io::stdout(), EnableMouseCapture);
+}
+
+fn release_mouse() {
+    let _ = execute!(io::stdout(), DisableMouseCapture);
+}
+
 /// Hands the terminal to `cmd` (an editor or shell) and takes it back when it exits.
-fn suspend(terminal: &mut DefaultTerminal, mut cmd: Command, app: &mut App) -> io::Result<()> {
+fn suspend(
+    terminal: &mut DefaultTerminal,
+    mut cmd: Command,
+    app: &mut App,
+    mouse: bool,
+) -> io::Result<()> {
+    if mouse {
+        release_mouse();
+    }
     ratatui::restore();
     let status = cmd.status();
     enable_raw_mode()?;
     execute!(io::stdout(), EnterAlternateScreen)?;
+    if mouse {
+        capture_mouse();
+    }
     terminal.clear()?;
     app.after_run(status);
     Ok(())
@@ -163,27 +216,20 @@ mod tests {
 
     #[test]
     fn parses_arguments() {
-        assert_eq!(
-            args(&[]),
+        let run = |start: &str, cwd_file: Option<&str>, mouse| {
             Ok(Cli::Run {
-                start: ".".into(),
-                cwd_file: None
+                start: start.into(),
+                cwd_file: cwd_file.map(PathBuf::from),
+                mouse,
             })
-        );
+        };
+        assert_eq!(args(&[]), run(".", None, true));
         assert_eq!(
             args(&["src", "--cwd-file", "/tmp/x"]),
-            Ok(Cli::Run {
-                start: "src".into(),
-                cwd_file: Some("/tmp/x".into())
-            })
+            run("src", Some("/tmp/x"), true)
         );
-        assert_eq!(
-            args(&["--cwd-file=/tmp/y"]),
-            Ok(Cli::Run {
-                start: ".".into(),
-                cwd_file: Some("/tmp/y".into())
-            })
-        );
+        assert_eq!(args(&["--cwd-file=/tmp/y"]), run(".", Some("/tmp/y"), true));
+        assert_eq!(args(&["--no-mouse", "src"]), run("src", None, false));
         assert_eq!(args(&["-h"]), Ok(Cli::Help));
         assert_eq!(args(&["--version"]), Ok(Cli::Version));
         assert!(args(&["--cwd-file"]).is_err());

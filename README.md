@@ -25,6 +25,8 @@ fuzzy filtering, and syntax-highlighted previews.
 - **File operations**: copy, cut, paste, rename, trash, and `a src/new/mod.rs` to create a file with its parents.
 - **Hands off to your tools**: `$EDITOR`, a shell in the current directory, the system opener,
   and the clipboard.
+- **Mouse**: wheel scrolls, click selects, double-click opens, and a click in the parent column
+  or a directory preview goes there. `--no-mouse` leaves the mouse to the terminal.
 - **Cd on quit**, so the shell follows you (see below).
 - Watches the current directory and refreshes when it changes.
 
@@ -39,10 +41,12 @@ It runs on macOS and Linux, and needs `git` on your `PATH` for status.
 ## Usage
 
 ```
-findr [PATH] [--cwd-file FILE]
+findr [PATH] [--cwd-file FILE] [--no-mouse]
 ```
 
 `PATH` may be a file, which opens its directory with the cursor on it. Press `?` for keys.
+While findr has the mouse, most terminals still select text with a modifier held (Option in
+iTerm2 and Ghostty, Shift in most others); `--no-mouse` gives it back entirely.
 
 | Keys | |
 | --- | --- |

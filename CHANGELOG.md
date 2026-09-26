@@ -20,3 +20,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Copy, cut, paste, rename, create (with parent directories), and move to trash.
 - `$EDITOR`, shell, system opener, and clipboard integration.
 - `--cwd-file` for changing the shell's directory on quit.
+- Mouse support: wheel scrolling, click to select, double-click to open, and click-to-go in
+  the parent column and directory previews. `--no-mouse` turns it off.
