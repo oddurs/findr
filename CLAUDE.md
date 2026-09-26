@@ -60,6 +60,10 @@ especially *Look at this sceptically*: name the weakest part of the change.
 
 ## Architecture, and what must stay true
 
+- **The screen follows `docs/design.md`.** Read it before changing anything a user sees: each
+  piece of information has one region, colours are roles from the theme, and views are built
+  from the shared components. If a change needs a new rule, change the document with it.
+
 - `src/app.rs` owns state and key handling. Work that needs the terminal (an
   editor, a shell, quitting) is returned as an `Effect` and carried out by
   `src/main.rs`. Do not touch the terminal from `app.rs` or `ui.rs`.
