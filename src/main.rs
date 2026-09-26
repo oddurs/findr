@@ -119,8 +119,8 @@ fn run(terminal: &mut DefaultTerminal, app: &mut App) -> io::Result<bool> {
             terminal.draw(|frame| ui::draw(frame, app))?;
             dirty = false;
         }
-        // Poll quickly only while a preview is on its way.
-        let timeout = if app.preview_pending() { 15 } else { 250 };
+        // Poll quickly only while a worker owes us an answer.
+        let timeout = if app.pending() { 15 } else { 250 };
         if event::poll(Duration::from_millis(timeout))? {
             match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
@@ -137,7 +137,7 @@ fn run(terminal: &mut DefaultTerminal, app: &mut App) -> io::Result<bool> {
         } else {
             dirty |= app.tick();
         }
-        dirty |= app.poll_preview();
+        dirty |= app.poll_preview() | app.poll_git();
     }
 }
 

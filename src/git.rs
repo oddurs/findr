@@ -3,6 +3,8 @@
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::thread;
 
 /// Ordered by how much it matters, so a directory shows the most pressing status inside it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -42,6 +44,31 @@ pub fn find_root(dir: &Path) -> Option<PathBuf> {
     dir.ancestors()
         .find(|d| d.join(".git").exists())
         .map(Path::to_path_buf)
+}
+
+pub struct Response {
+    pub root: PathBuf,
+    pub repo: io::Result<Repo>,
+}
+
+/// A worker that runs `git status` for repository roots sent to it. In a large repository
+/// that takes long enough to stall the cursor, so it never runs on the event loop.
+pub fn spawn() -> (Sender<PathBuf>, Receiver<Response>) {
+    let (req_tx, req_rx) = mpsc::channel::<PathBuf>();
+    let (resp_tx, resp_rx) = mpsc::channel();
+    thread::spawn(move || {
+        while let Ok(mut root) = req_rx.recv() {
+            // Only the newest request matters; the rest are for places already left behind.
+            while let Ok(newer) = req_rx.try_recv() {
+                root = newer;
+            }
+            let repo = Repo::load(&root);
+            if resp_tx.send(Response { root, repo }).is_err() {
+                break;
+            }
+        }
+    });
+    (req_tx, resp_rx)
 }
 
 impl Repo {
