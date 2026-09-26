@@ -6,6 +6,7 @@
 
 use ratatui::style::{Color, Modifier, Style};
 
+use super::glyphs::Glyphs;
 use crate::git::Status;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,6 +37,8 @@ pub struct Theme {
     /// Faint washes behind added and removed lines of a diff, so the code keeps its colours.
     pub added_bg: Color,
     pub removed_bg: Color,
+    /// The symbols to draw with; chosen at start-up from what the terminal can show.
+    pub glyphs: Glyphs,
 }
 
 /// The tones a badge, chip or message can take.
@@ -71,6 +74,7 @@ impl Theme {
         context_bg: Color::Indexed(236),
         added_bg: Color::Indexed(22),
         removed_bg: Color::Indexed(52),
+        glyphs: Glyphs::NERD,
     };
 
     pub const LIGHT: Theme = Theme {
@@ -158,10 +162,25 @@ mod tests {
             ("components.rs", include_str!("components.rs")),
         ];
         for (file, source) in views {
+            // Comments may show what a symbol looks like; only code is held to the rule.
+            let source: String = source
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n");
             assert!(
                 !source.contains(concat!("Color", "::")),
                 "src/ui/{file} names a colour; use a role from the theme"
             );
+            // Likewise every drawn symbol comes from the glyph table, so ASCII terminals get
+            // their fallback. (Help's arrow keys are rewritten per tier where they are drawn.)
+            for glyph in ["▌", "▍", "▐", "…", "✓", "✗", "●", "›", "╭", "\\u{e725}"]
+            {
+                assert!(
+                    !source.contains(glyph),
+                    "src/ui/{file} draws {glyph:?} itself; take it from theme.glyphs"
+                );
+            }
         }
     }
 

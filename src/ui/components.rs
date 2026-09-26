@@ -3,7 +3,7 @@
 
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType};
+use ratatui::widgets::Block;
 
 use super::theme::{Theme, Tone};
 
@@ -42,7 +42,10 @@ pub fn facts(items: &[String], theme: &Theme) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
     for (i, item) in items.iter().enumerate() {
         if i > 0 {
-            spans.push(Span::styled(" · ", theme.faint()));
+            spans.push(Span::styled(
+                format!(" {} ", theme.glyphs.separator),
+                theme.faint(),
+            ));
         }
         spans.push(Span::styled(item.to_string(), theme.muted()));
     }
@@ -51,15 +54,16 @@ pub fn facts(items: &[String], theme: &Theme) -> Vec<Span<'static>> {
 
 /// A label for text input: `rename ›`.
 pub fn prompt_label(label: &str, theme: &Theme) -> Span<'static> {
-    Span::styled(format!(" {label} › "), Style::new().fg(theme.accent))
+    let prompt = theme.glyphs.prompt;
+    Span::styled(format!(" {label} {prompt} "), Style::new().fg(theme.accent))
 }
 
 /// An outcome: a mark and the text in the tone of how it went.
 pub fn message(text: &str, tone: Tone, theme: &Theme) -> Line<'static> {
     let mark = match tone {
-        Tone::Success => "✓ ",
-        Tone::Danger => "✗ ",
-        _ => "",
+        Tone::Success => format!("{} ", theme.glyphs.success),
+        Tone::Danger => format!("{} ", theme.glyphs.failure),
+        _ => String::new(),
     };
     let color = match tone {
         Tone::Success | Tone::Danger => Style::new().fg(theme.tone(tone)),
@@ -76,7 +80,7 @@ pub fn empty(text: &str, theme: &Theme) -> Line<'static> {
 /// The frame every overlay shares: rounded, faint, with an accent title.
 pub fn panel(title: &str, theme: &Theme) -> Block<'static> {
     Block::bordered()
-        .border_type(BorderType::Rounded)
+        .border_set(theme.glyphs.border)
         .border_style(theme.faint())
         .title(Span::styled(
             format!(" {title} "),
@@ -86,6 +90,7 @@ pub fn panel(title: &str, theme: &Theme) -> Block<'static> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::glyphs::Glyphs;
     use super::*;
 
     fn text(spans: &[Span]) -> String {
@@ -110,11 +115,16 @@ mod tests {
     }
 
     #[test]
-    fn messages_mark_success_and_failure() {
-        let t = Theme::DARK;
-        let line = |tone| message("done", tone, &t).to_string();
-        assert_eq!(line(Tone::Success), " ✓ done");
-        assert_eq!(line(Tone::Danger), " ✗ done");
-        assert_eq!(line(Tone::Muted), " done");
+    fn messages_mark_success_and_failure_in_every_tier() {
+        for glyphs in [Glyphs::NERD, Glyphs::UNICODE, Glyphs::ASCII] {
+            let t = Theme {
+                glyphs,
+                ..Theme::DARK
+            };
+            let line = |tone| message("done", tone, &t).to_string();
+            assert_eq!(line(Tone::Success), format!(" {} done", glyphs.success));
+            assert_eq!(line(Tone::Danger), format!(" {} done", glyphs.failure));
+            assert_eq!(line(Tone::Muted), " done");
+        }
     }
 }

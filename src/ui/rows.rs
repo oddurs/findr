@@ -15,7 +15,6 @@ pub(super) struct Row<'a> {
     pub theme: &'a Theme,
     pub width: usize,
     pub size: bool,
-    pub icons: bool,
     /// Context rows: names and icons muted so they do not compete with the listing.
     pub muted: bool,
 }
@@ -52,7 +51,7 @@ pub(super) fn entry_line(
     let theme = row.theme;
     let mut spans = vec![
         if marked {
-            Span::styled("▍", Style::new().fg(theme.mark))
+            Span::styled(theme.glyphs.mark, Style::new().fg(theme.mark))
         } else {
             Span::raw(" ")
         },
@@ -73,8 +72,9 @@ pub(super) fn entry_line(
         name_style(entry, status, theme)
     };
     // The glyph plus a space: Nerd Font icons are drawn wider than a cell and need the room.
-    let icon_width = if row.icons { 2 } else { 0 };
-    if row.icons {
+    let icons = theme.glyphs.icons();
+    let icon_width = if icons { 2 } else { 0 };
+    if icons {
         let icon = icons::for_entry(entry);
         let color = if row.muted { theme.muted } else { icon.color };
         let style = Style::new().fg(color).add_modifier(base.add_modifier);
@@ -87,7 +87,14 @@ pub(super) fn entry_line(
     if entry.is_dir {
         name.push('/');
     }
-    let used = push_name(&mut spans, &name, hits, base, theme.matched(), room);
+    let used = push_name(
+        &mut spans,
+        &name,
+        hits,
+        (base, theme.matched()),
+        room,
+        theme.glyphs.ellipsis,
+    );
     if !size.is_empty() {
         let pad = row.width.saturating_sub(gutter + used + size.len());
         spans.push(Span::raw(" ".repeat(pad)));
@@ -101,13 +108,13 @@ fn push_name(
     spans: &mut Vec<Span<'static>>,
     name: &str,
     hits: &[usize],
-    base: Style,
-    hit: Style,
+    (base, hit): (Style, Style),
     room: usize,
+    ellipsis: &'static str,
 ) -> usize {
     let total = name.width();
     let limit = if total > room {
-        room.saturating_sub(1)
+        room.saturating_sub(ellipsis.width())
     } else {
         room
     };
@@ -132,8 +139,8 @@ fn push_name(
         spans.push(Span::styled(run, if run_hit { hit } else { base }));
     }
     if total > room && room > 0 {
-        spans.push(Span::styled("…", base));
-        used += 1;
+        spans.push(Span::styled(ellipsis, base));
+        used += ellipsis.width();
     }
     used
 }
@@ -149,7 +156,8 @@ pub(super) fn find_line(path: &str, hits: &[usize], row: &Row) -> Line<'static> 
         .rposition(|&c| c == '/')
         .map_or(0, |i| i + 1);
     // One column goes to the leading space, two more to an icon and its gap.
-    let room = row.width.saturating_sub(if row.icons { 3 } else { 1 });
+    let icons = theme.glyphs.icons();
+    let room = row.width.saturating_sub(if icons { 3 } else { 1 });
     let mut start = 0;
     let mut used: usize = chars.iter().map(|c| c.width().unwrap_or(0)).sum();
     if used > room {
@@ -168,7 +176,7 @@ pub(super) fn find_line(path: &str, hits: &[usize], row: &Row) -> Line<'static> 
         Style::new()
     };
     let mut spans = vec![Span::raw(" ")];
-    if row.icons {
+    if icons {
         let base = path
             .trim_end_matches('/')
             .rsplit('/')
@@ -186,7 +194,7 @@ pub(super) fn find_line(path: &str, hits: &[usize], row: &Row) -> Line<'static> 
         ));
     }
     if start > 0 {
-        spans.push(Span::styled("…", theme.muted()));
+        spans.push(Span::styled(theme.glyphs.ellipsis, theme.muted()));
     }
     let mut hits = hits.iter().peekable();
     while hits.next_if(|&&h| h < start).is_some() {}
@@ -219,12 +227,16 @@ mod tests {
     use super::*;
     use crate::dir::testutil::TempDir;
 
+    const PLAIN: Theme = Theme {
+        glyphs: super::super::glyphs::Glyphs::UNICODE,
+        ..Theme::DARK
+    };
+
     fn row(width: usize, icons: bool, muted: bool) -> Row<'static> {
         Row {
-            theme: &Theme::DARK,
+            theme: if icons { &Theme::DARK } else { &PLAIN },
             width,
             size: true,
-            icons,
             muted,
         }
     }
@@ -240,7 +252,8 @@ mod tests {
         let e = Entry::from_path(path).unwrap();
         let line = entry_line(&e, &[], None, false, &row(20, false, false));
         assert_eq!(line.width(), 20);
-        assert!(text(&line).contains('…'), "{}", text(&line));
+        let ellipsis = PLAIN.glyphs.ellipsis;
+        assert!(text(&line).contains(ellipsis), "{}", text(&line));
         assert!(text(&line).ends_with("0 B"), "{}", text(&line));
     }
 
@@ -268,7 +281,10 @@ mod tests {
             &[],
             &row(16, false, false),
         );
-        assert_eq!(text(&long), " …ath/to/main.rs");
+        assert_eq!(
+            text(&long),
+            format!(" {}ath/to/main.rs", PLAIN.glyphs.ellipsis)
+        );
         assert_eq!(long.width(), 16);
     }
 }

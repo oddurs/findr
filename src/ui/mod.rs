@@ -10,6 +10,7 @@ use std::time::SystemTime;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
+use ratatui::symbols::border;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
@@ -22,6 +23,7 @@ use crate::icons;
 use crate::preview::{DiffLine, Preview};
 
 mod components;
+pub mod glyphs;
 mod overlays;
 mod rows;
 pub mod theme;
@@ -72,7 +74,7 @@ pub fn draw(frame: &mut Frame, app: &mut App, theme: &Theme) {
     draw_command(frame, app, theme, r.command);
     match &app.mode {
         Mode::Help => draw_help(frame, frame.area(), theme),
-        Mode::Find(finder) => draw_find(frame, finder, frame.area(), app.icons, theme),
+        Mode::Find(finder) => draw_find(frame, finder, frame.area(), theme),
         _ => {}
     }
 }
@@ -136,8 +138,13 @@ fn layout(frame: &mut Frame, app: &App, theme: &Theme) -> Regions {
 
 /// The faint rule between columns; returns what is right of it.
 fn rule(frame: &mut Frame, theme: &Theme, area: Rect) -> Rect {
+    let set = border::Set {
+        vertical_left: theme.glyphs.rule,
+        ..border::PLAIN
+    };
     let block = Block::new()
         .borders(Borders::LEFT)
+        .border_set(set)
         .border_style(theme.faint());
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -159,24 +166,27 @@ fn draw_location(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
 
     let mut right = Vec::new();
     if let Some(repo) = &app.git {
-        let icon = if app.icons { "\u{e725} " } else { "" };
+        let icon = theme.glyphs.branch;
         let branch = repo.branch.as_deref().unwrap_or("?");
         right.push(Span::styled(
             format!("{icon}{branch}"),
             Style::new().fg(theme.branch),
         ));
         if repo.is_dirty() {
-            right.push(Span::styled(" ●", Style::new().fg(theme.warning)));
+            right.push(Span::styled(
+                format!(" {}", theme.glyphs.dot),
+                Style::new().fg(theme.warning),
+            ));
         }
         if repo.ahead > 0 {
             right.push(Span::styled(
-                format!(" ↑{}", repo.ahead),
+                format!(" {}{}", theme.glyphs.up, repo.ahead),
                 Style::new().fg(theme.success),
             ));
         }
         if repo.behind > 0 {
             right.push(Span::styled(
-                format!(" ↓{}", repo.behind),
+                format!(" {}{}", theme.glyphs.down, repo.behind),
                 Style::new().fg(theme.danger),
             ));
         }
@@ -221,7 +231,6 @@ fn draw_context(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
                 theme,
                 width: area.width as usize,
                 size: false,
-                icons: app.icons,
                 muted: !here,
             };
             let line = entry_line(e, &[], status(app.git.as_ref(), e), false, &row);
@@ -261,7 +270,6 @@ fn draw_listing(frame: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
         theme,
         width: area.width as usize - usize::from(overflow),
         size: true,
-        icons: app.icons,
         muted: false,
     };
     let lines: Vec<Line> = app.view[app.offset..]
@@ -278,7 +286,7 @@ fn draw_listing(frame: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
             }
             // The cursor row carries an accent bar in the mark column, unless it is marked.
             if !marked {
-                line.spans[0] = Span::styled("▌", Style::new().fg(theme.accent));
+                line.spans[0] = Span::styled(theme.glyphs.cursor, Style::new().fg(theme.accent));
             }
             line.patch_style(theme.selected())
         })
@@ -292,7 +300,7 @@ fn draw_listing(frame: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
             .begin_symbol(None)
             .end_symbol(None)
             .track_symbol(None)
-            .thumb_symbol("▐")
+            .thumb_symbol(theme.glyphs.thumb)
             .thumb_style(theme.muted());
         frame.render_stateful_widget(bar, area, &mut state);
     }
@@ -327,7 +335,7 @@ fn draw_inspector(frame: &mut Frame, app: &App, theme: &Theme, r: &Regions) {
         .map(|(_, p)| p);
 
     let mut title = Vec::new();
-    if app.icons {
+    if theme.glyphs.icons() {
         let icon = icons::for_entry(entry);
         title.push(Span::styled(
             format!("{} ", icon.glyph),
@@ -340,12 +348,12 @@ fn draw_inspector(frame: &mut Frame, app: &App, theme: &Theme, r: &Regions) {
     ));
     frame.render_widget(Paragraph::new(Line::from(title)), r.title);
 
-    let mut line = facts(&entry_facts(entry, preview), theme);
+    let mut line = facts(&entry_facts(entry, preview, theme), theme);
     if entry.is_symlink
         && let Ok(target) = std::fs::read_link(&entry.path)
     {
         line.push(Span::styled(
-            format!("  → {}", target.display()),
+            format!("  {} {}", theme.glyphs.arrow, target.display()),
             Style::new().fg(theme.link),
         ));
     }
@@ -361,7 +369,6 @@ fn draw_inspector(frame: &mut Frame, app: &App, theme: &Theme, r: &Regions) {
                 theme,
                 width: area.width as usize,
                 size: true,
-                icons: app.icons,
                 muted: false,
             };
             entries
@@ -411,9 +418,9 @@ fn diff_line(line: &DiffLine, width: usize, theme: &Theme) -> Line<'static> {
 }
 
 /// The inspector's facts line: what kind of thing, how big, how old, who may touch it.
-fn entry_facts(entry: &Entry, preview: Option<&Preview>) -> Vec<String> {
-    let kind = match preview {
-        Some(Preview::Dir(entries)) => count(entries.len()),
+fn entry_facts(entry: &Entry, preview: Option<&Preview>, theme: &Theme) -> Vec<String> {
+    let mut facts = match preview {
+        Some(Preview::Dir(entries)) => vec![count(entries.len())],
         Some(Preview::Text {
             syntax,
             lines,
@@ -426,23 +433,27 @@ fn entry_facts(entry: &Entry, preview: Option<&Preview>) -> Vec<String> {
             } else {
                 "lines"
             };
-            format!(
-                "{syntax} · {} · {n}{more} {noun}",
-                dir::human_size(entry.size)
-            )
+            vec![
+                syntax.clone(),
+                dir::human_size(entry.size),
+                format!("{n}{more} {noun}"),
+            ]
         }
-        Some(Preview::Diff { added, removed, .. }) => {
-            format!("changes against HEAD · +{added} −{removed}")
-        }
-        Some(Preview::Note(note)) => note.clone(),
-        None if entry.is_dir => String::new(),
-        None => dir::human_size(entry.size),
+        Some(Preview::Diff { added, removed, .. }) => vec![
+            "changes against HEAD".into(),
+            format!("+{added} {}{removed}", theme.glyphs.minus),
+        ],
+        Some(Preview::Note(note)) => vec![note.clone()],
+        None if entry.is_dir => Vec::new(),
+        None => vec![dir::human_size(entry.size)],
     };
     let age = entry
         .modified
         .map(|t| dir::fmt_age(t, SystemTime::now()))
         .unwrap_or_default();
-    vec![kind, age, dir::mode_string(entry)]
+    facts.push(age);
+    facts.push(dir::mode_string(entry));
+    facts
 }
 
 /// The mode, what is pending, and where in the listing.
@@ -486,7 +497,11 @@ fn draw_status(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
         left.push(chip);
     }
 
-    let arrow = if app.reverse { "↑" } else { "↓" };
+    let arrow = if app.reverse {
+        theme.glyphs.up
+    } else {
+        theme.glyphs.down
+    };
     let position = if app.view.is_empty() {
         0
     } else {
@@ -543,11 +558,19 @@ fn draw_command(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
             Line::from(spans)
         }
         Mode::Filter => keys(
-            &pairs(&[("enter", "keep"), ("esc", "clear"), ("↑ ↓", "move")]),
+            &pairs(&[
+                ("enter", "keep"),
+                ("esc", "clear"),
+                (theme.glyphs.up_down, "move"),
+            ]),
             theme,
         ),
         Mode::Find(_) => keys(
-            &pairs(&[("enter", "go there"), ("esc", "cancel"), ("↑ ↓", "move")]),
+            &pairs(&[
+                ("enter", "go there"),
+                ("esc", "cancel"),
+                (theme.glyphs.up_down, "move"),
+            ]),
             theme,
         ),
         Mode::Goto => keys(

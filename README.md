@@ -92,6 +92,21 @@ iTerm2 and Ghostty, Shift in most others); `--no-mouse` gives it back entirely.
 
 Trash goes to `~/.Trash` on macOS and the freedesktop trash elsewhere. findr never deletes outright.
 
+## Settings
+
+findr reads `~/.config/findr/config.toml` (or `$XDG_CONFIG_HOME/findr/config.toml`) if it
+exists. Every setting is optional; flags on the command line win.
+
+```toml
+glyphs = "auto"   # "nerd", "unicode" or "ascii"
+theme = "dark"    # or "light"
+mouse = true
+```
+
+`glyphs = "auto"` uses Nerd Font icons when a Nerd Font is installed, plain Unicode when not,
+and ASCII when the terminal is not UTF-8. If icons show as boxes, your terminal is not using
+the Nerd Font: choose it as the terminal's font, or set `glyphs = "unicode"`.
+
 ## Cd on quit
 
 `q` writes the final directory to the file given by `--cwd-file`. Wrap findr in a shell
