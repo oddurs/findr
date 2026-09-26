@@ -129,6 +129,8 @@ pub enum Confirm {
 /// A paste running on a worker thread.
 pub struct Job {
     pub dest: PathBuf,
+    /// A cut moves its items, a copy makes new ones; undo differs.
+    pub cut: bool,
     pub total: usize,
     pub done: usize,
     rx: Receiver<JobEvent>,
@@ -257,6 +259,19 @@ pub fn parent_offset(selected: usize, len: usize, height: usize) -> usize {
         .min(len.saturating_sub(height))
 }
 
+/// Something `u` can take back, recorded as it happens.
+enum Undo {
+    /// (where it was, where it went in the trash)
+    Trash(Vec<(PathBuf, PathBuf)>),
+    /// (old path, new path), for one rename or a bulk one.
+    Rename(Vec<(PathBuf, PathBuf)>),
+    /// A cut and paste: (where it came from, where it went).
+    Move(Vec<(PathBuf, PathBuf)>),
+    /// Things that did not exist before: pasted copies, new files and directories. Undone by
+    /// moving them to the trash, so the undo can itself be recovered.
+    Create(Vec<PathBuf>),
+}
+
 /// A rename of several entries, waiting for the editor to return with the new names.
 struct BulkRename {
     list: PathBuf,
@@ -288,8 +303,8 @@ pub struct App {
     pub clip: Option<Clip>,
     pub job: Option<Job>,
     bulk: Option<BulkRename>,
-    /// What each trash action moved, as (original, where it went), for undo. Newest last.
-    trashed: Vec<Vec<(PathBuf, PathBuf)>>,
+    /// What `u` can take back, newest last.
+    undo: Vec<Undo>,
     /// Recent find indexes by (show_hidden, root), newest first.
     find_cache: Vec<(bool, Arc<find::Index>)>,
     pub git: Option<Repo>,
@@ -347,7 +362,7 @@ impl App {
             clip: None,
             job: None,
             bulk: None,
-            trashed: Vec::new(),
+            undo: Vec::new(),
             find_cache: Vec::new(),
             git: None,
             message: None,
@@ -675,7 +690,8 @@ impl App {
                 Ok(n) => {
                     // The marks named the old paths.
                     self.marked.clear();
-                    self.success(format!("renamed {}", count(n)));
+                    self.undo.push(Undo::Rename(plan));
+                    self.success(format!("renamed {} · u to undo", count(n)));
                 }
                 Err(e) => self.error(e.to_string()),
             },
@@ -819,7 +835,7 @@ impl App {
             KeyCode::Char('y') => self.yank(false),
             KeyCode::Char('x') => self.yank(true),
             KeyCode::Char('p') => self.paste(),
-            KeyCode::Char('u') => self.undo_trash(),
+            KeyCode::Char('u') => self.undo(),
             KeyCode::Char('d') => {
                 let targets = self.targets();
                 if !targets.is_empty() {
@@ -930,23 +946,30 @@ impl App {
         if text.is_empty() {
             return;
         }
-        let (created, done) = match input.kind {
-            InputKind::Rename(from) => (
-                ops::rename(&from, text).map(|()| text.to_string()),
-                format!("renamed to {text}"),
-            ),
+        let (created, done, undo) = match input.kind {
+            InputKind::Rename(from) => {
+                let to = from.with_file_name(text);
+                (
+                    ops::rename(&from, text).map(|()| text.to_string()),
+                    format!("renamed to {text}"),
+                    Undo::Rename(vec![(from, to)]),
+                )
+            }
             InputKind::NewFile => (
                 ops::create(&self.cwd, text, false),
                 format!("created {text}"),
+                Undo::Create(vec![self.cwd.join(text)]),
             ),
             InputKind::NewDir => (
                 ops::create(&self.cwd, text, true),
                 format!("created {text}/"),
+                Undo::Create(vec![self.cwd.join(text)]),
             ),
             InputKind::Jump => return self.jump(text),
         };
         match created {
             Ok(name) => {
+                self.undo.push(undo);
                 self.reload_selecting(Some(name));
                 self.sync_git(true);
                 self.success(done);
@@ -1268,6 +1291,7 @@ impl App {
         });
         self.job = Some(Job {
             dest: self.cwd.clone(),
+            cut: clip.cut,
             total: clip.paths.len(),
             done: 0,
             rx,
@@ -1298,10 +1322,10 @@ impl App {
             }
             changed = true;
         }
-        let (dest, total) = (job.dest.clone(), job.total);
+        let (dest, total, cut) = (job.dest.clone(), job.total, job.cut);
         if let Some(pasted) = finished {
             self.job = None;
-            self.finish_paste(&dest, total, pasted);
+            self.finish_paste(&dest, total, cut, pasted);
             return true;
         }
         if vanished {
@@ -1313,7 +1337,14 @@ impl App {
         changed
     }
 
-    fn finish_paste(&mut self, dest: &Path, total: usize, pasted: ops::Pasted) {
+    fn finish_paste(&mut self, dest: &Path, total: usize, cut: bool, pasted: ops::Pasted) {
+        if !pasted.moved.is_empty() {
+            self.undo.push(if cut {
+                Undo::Move(pasted.moved.clone())
+            } else {
+                Undo::Create(pasted.moved.iter().map(|(_, to)| to.clone()).collect())
+            });
+        }
         // The cursor follows the pasted item only if we are still looking at where it went.
         let select = pasted.last.filter(|_| dest == self.cwd);
         self.reload_selecting(select.or_else(|| self.selected().map(|e| e.name.clone())));
@@ -1321,7 +1352,7 @@ impl App {
         let done = pasted.done;
         match pasted.failure {
             Some(f) => self.error(format!("pasted {done} of {total}: {f}")),
-            None => self.success(format!("pasted {}", count(done))),
+            None => self.success(format!("pasted {} · u to undo", count(done))),
         }
     }
 
@@ -1345,7 +1376,7 @@ impl App {
         }
         let done = batch.len();
         if !batch.is_empty() {
-            self.trashed.push(batch);
+            self.undo.push(Undo::Trash(batch));
         }
         // The item under the cursor is gone; stay at the same row rather than jumping to the top.
         let row = self.selected;
@@ -1358,35 +1389,91 @@ impl App {
         }
     }
 
-    /// Puts the most recently trashed batch back.
-    fn undo_trash(&mut self) {
-        let (Some(trash), Some(batch)) = (self.trash.clone(), self.trashed.pop()) else {
+    /// Takes back the most recent trash, rename, paste or creation.
+    fn undo(&mut self) {
+        let Some(action) = self.undo.pop() else {
             return self.info("nothing to undo");
         };
-        let total = batch.len();
-        let mut restored = Vec::new();
-        let mut failure = None;
-        for (original, trashed) in &batch {
+        let outcome = match action {
+            Undo::Trash(batch) => self.undo_trash(&batch),
+            Undo::Rename(plan) => ops::reverse_renames(&plan)
+                .map(|n| {
+                    (
+                        format!("renamed {} back", count(n)),
+                        plan.first().map(|(old, _)| old.clone()),
+                    )
+                })
+                .map_err(|e| e.to_string()),
+            Undo::Move(moved) => {
+                let mut back = None;
+                let mut result = Ok(());
+                for (from, to) in &moved {
+                    let (Some(dir), Some(name)) = (from.parent(), from.file_name()) else {
+                        continue;
+                    };
+                    // Never over something that has taken the old name since.
+                    let dest = ops::unique_dest(dir, &name.to_string_lossy());
+                    if let Err(e) = ops::move_path(to, &dest) {
+                        result = Err(format!("{}: {e}", to.display()));
+                        break;
+                    }
+                    back.get_or_insert(dest);
+                }
+                result.map(|()| (format!("moved {} back", count(moved.len())), back))
+            }
+            Undo::Create(paths) => match self.trash.clone() {
+                None => Err("no trash directory: HOME is not set".into()),
+                Some(trash) => paths
+                    .iter()
+                    .try_for_each(|p| {
+                        trash
+                            .put(p)
+                            .map(drop)
+                            .map_err(|e| format!("{}: {e}", p.display()))
+                    })
+                    .map(|()| (format!("moved {} to the trash", count(paths.len())), None)),
+            },
+        };
+        match outcome {
+            Ok((message, select)) => {
+                let select = select
+                    .filter(|p| p.parent() == Some(self.cwd.as_path()))
+                    .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()));
+                self.reload_selecting(select.or_else(|| self.selected().map(|e| e.name.clone())));
+                self.sync_git(true);
+                self.success(message);
+            }
+            Err(e) => {
+                self.reload();
+                self.error(format!("undo: {e}"));
+            }
+        }
+    }
+
+    fn undo_trash(
+        &self,
+        batch: &[(PathBuf, PathBuf)],
+    ) -> Result<(String, Option<PathBuf>), String> {
+        let trash = self
+            .trash
+            .clone()
+            .ok_or("no trash directory: HOME is not set")?;
+        let mut first = None;
+        for (done, (original, trashed)) in batch.iter().enumerate() {
             match trash.restore(trashed, original) {
-                Ok(back) => restored.push(back),
+                Ok(back) => {
+                    first.get_or_insert(back);
+                }
                 Err(e) => {
-                    failure = Some(format!("{}: {e}", original.display()));
-                    break;
+                    return Err(format!(
+                        "restored {done} of {}: {}: {e}",
+                        batch.len(),
+                        original.display()
+                    ));
                 }
             }
         }
-        let select = restored
-            .iter()
-            .find(|p| p.parent() == Some(self.cwd.as_path()))
-            .and_then(|p| p.file_name())
-            .map(|n| n.to_string_lossy().into_owned());
-        self.reload_selecting(select.or_else(|| self.selected().map(|e| e.name.clone())));
-        self.sync_git(true);
-        let done = restored.len();
-        match failure {
-            Some(f) => self.error(format!("restored {done} of {total}: {f}")),
-            None => self.success(format!("restored {}", count(done))),
-        }
+        Ok((format!("restored {}", count(batch.len())), first))
     }
 }
 
@@ -1545,6 +1632,7 @@ mod tests {
         let (_tx, rx) = mpsc::channel();
         app.job = Some(Job {
             dest: app.cwd.clone(),
+            cut: false,
             total: 1,
             done: 0,
             rx,
@@ -1567,6 +1655,7 @@ mod tests {
         let (_tx, rx) = mpsc::channel();
         app.job = Some(Job {
             dest: app.cwd.clone(),
+            cut: false,
             total: 1,
             done: 0,
             rx,
@@ -1618,6 +1707,82 @@ mod tests {
         assert_eq!(app.selected().unwrap().name, "README.md");
         press(&mut app, "u");
         assert!(tmp.path().join("Cargo.toml").exists());
+        press(&mut app, "u");
+        assert_eq!(app.message().unwrap().text, "nothing to undo");
+    }
+
+    #[test]
+    fn u_takes_back_a_rename() {
+        let (tmp, mut app) = setup();
+        press(&mut app, "G");
+        press(&mut app, "r");
+        let Mode::Input(input) = &mut app.mode else {
+            panic!("expected the prompt")
+        };
+        input.text = "NOTES.md".into();
+        press(&mut app, "\n");
+        assert!(tmp.path().join("NOTES.md").exists());
+        press(&mut app, "u");
+        assert!(tmp.path().join("README.md").exists());
+        assert!(!tmp.path().join("NOTES.md").exists());
+        assert_eq!(app.selected().unwrap().name, "README.md");
+    }
+
+    #[test]
+    fn u_refuses_a_rename_back_onto_a_new_file() {
+        let (tmp, mut app) = setup();
+        press(&mut app, "G");
+        press(&mut app, "r");
+        let Mode::Input(input) = &mut app.mode else {
+            panic!("expected the prompt")
+        };
+        input.text = "OLD.md".into();
+        press(&mut app, "\n");
+        tmp.file("README.md", "a new readme");
+        press(&mut app, "u");
+        assert_eq!(app.message().unwrap().kind, MessageKind::Error);
+        assert!(tmp.path().join("OLD.md").exists(), "nothing moved");
+        assert_eq!(
+            fs::read_to_string(tmp.path().join("README.md")).unwrap(),
+            "a new readme"
+        );
+    }
+
+    #[test]
+    fn u_moves_a_cut_back_and_trashes_a_copy() {
+        let (tmp, mut app) = setup();
+        press(&mut app, "Gx");
+        press(&mut app, "ggl");
+        press(&mut app, "p");
+        wait(&mut app, |a| a.job.is_none());
+        assert!(tmp.path().join("src/README.md").exists());
+        press(&mut app, "u");
+        assert!(tmp.path().join("README.md").exists(), "moved back");
+        assert!(!tmp.path().join("src/README.md").exists());
+
+        // Up to the top, where the cursor lands on src, and copy it beside itself.
+        press(&mut app, "hy");
+        press(&mut app, "p");
+        wait(&mut app, |a| a.job.is_none());
+        let copy = tmp.path().join("src copy");
+        assert!(copy.exists());
+        press(&mut app, "u");
+        assert!(!copy.exists(), "the copy went to the trash");
+        assert!(tmp.path().join(".trash/src copy").exists());
+        assert!(
+            tmp.path().join("src/main.rs").exists(),
+            "the original is untouched"
+        );
+    }
+
+    #[test]
+    fn u_trashes_what_was_created() {
+        let (tmp, mut app) = setup();
+        press(&mut app, "adraft.md\n");
+        assert!(tmp.path().join("draft.md").exists());
+        press(&mut app, "u");
+        assert!(!tmp.path().join("draft.md").exists());
+        assert!(tmp.path().join(".trash/draft.md").exists());
         press(&mut app, "u");
         assert_eq!(app.message().unwrap().text, "nothing to undo");
     }
@@ -1942,7 +2107,7 @@ mod tests {
         assert!(tmp.path().join("READ_ME.md").exists());
         assert!(!tmp.path().join("README.md").exists());
         assert!(app.marked.is_empty());
-        assert_eq!(app.message().unwrap().text, "renamed 1 item");
+        assert_eq!(app.message().unwrap().text, "renamed 1 item · u to undo");
         assert!(!list.exists(), "the list is cleaned up");
     }
 
