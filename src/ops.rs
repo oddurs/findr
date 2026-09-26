@@ -110,6 +110,53 @@ pub fn move_path(src: &Path, dst: &Path) -> io::Result<()> {
     }
 }
 
+pub struct Pasted {
+    pub done: usize,
+    /// The name the last item landed under, for putting the cursor on it.
+    pub last: Option<String>,
+    pub failure: Option<String>,
+}
+
+/// Copies, or with `cut` moves, `paths` into `dest` under free names, stopping at the first
+/// failure. `progress` hears the running count after each item.
+pub fn paste(paths: &[PathBuf], dest: &Path, cut: bool, mut progress: impl FnMut(usize)) -> Pasted {
+    let mut pasted = Pasted {
+        done: 0,
+        last: None,
+        failure: None,
+    };
+    for src in paths {
+        if cut && src.parent() == Some(dest) {
+            continue;
+        }
+        if src.is_dir() && dest.starts_with(src) {
+            pasted.failure = Some(format!("cannot paste {} into itself", src.display()));
+            break;
+        }
+        let result = name_of(src).and_then(|name| {
+            let dst = unique_dest(dest, &name);
+            if cut {
+                move_path(src, &dst)
+            } else {
+                copy_all(src, &dst)
+            }
+            .map(|()| dst)
+        });
+        match result {
+            Ok(dst) => {
+                pasted.done += 1;
+                pasted.last = dst.file_name().map(|n| n.to_string_lossy().into_owned());
+                progress(pasted.done);
+            }
+            Err(e) => {
+                pasted.failure = Some(format!("{}: {e}", src.display()));
+                break;
+            }
+        }
+    }
+    pasted
+}
+
 #[derive(Debug, Clone)]
 pub enum Trash {
     /// A plain directory that items are moved into, as macOS's `~/.Trash`.
