@@ -5,6 +5,7 @@ use std::env;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
+use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
@@ -44,27 +45,34 @@ pub enum Mode {
 
 /// Rows the finder ranks and keeps; more than fit on any screen.
 pub const FIND_LIMIT: usize = 500;
+/// Indexes kept for reopening find instantly; each is the paths below one directory.
+const FIND_CACHE: usize = 8;
 
 /// The find-anywhere prompt: a query over an index built on a worker.
 pub struct Finder {
     pub query: String,
-    pub index: Option<find::Index>,
+    pub index: Option<Arc<find::Index>>,
     pub matches: Vec<find::Match>,
     pub selected: usize,
     rx: Option<Receiver<io::Result<find::Index>>>,
 }
 
 impl Finder {
-    fn open(root: PathBuf, show_hidden: bool) -> Finder {
-        Finder {
+    /// Opens on `cached` if there is one, so the list is there at once, and rebuilds the index
+    /// behind it either way: files come and go between visits.
+    fn open(root: PathBuf, show_hidden: bool, cached: Option<Arc<find::Index>>) -> Finder {
+        let mut finder = Finder {
             query: String::new(),
-            index: None,
+            index: cached,
             matches: Vec::new(),
             selected: 0,
             rx: Some(find::spawn(root, show_hidden)),
-        }
+        };
+        finder.rerank();
+        finder
     }
 
+    /// An index is being built, fresh or to replace the cached one.
     pub fn indexing(&self) -> bool {
         self.rx.is_some()
     }
@@ -88,8 +96,24 @@ impl Finder {
 
     fn chosen(&self) -> Option<PathBuf> {
         let index = self.index.as_ref()?;
+        Some(index.root.join(self.chosen_path()?))
+    }
+
+    fn chosen_path(&self) -> Option<&str> {
+        let index = self.index.as_ref()?;
         let m = self.matches.get(self.selected)?;
-        Some(index.root.join(&index.paths[m.idx]))
+        Some(&index.paths[m.idx])
+    }
+
+    /// Takes a newer index, keeping the query and, where it still exists, the selection.
+    fn replace_index(&mut self, index: Arc<find::Index>) {
+        let keep = self.chosen_path().map(str::to_string);
+        self.index = Some(index);
+        self.rerank();
+        if let (Some(keep), Some(index)) = (keep, &self.index) {
+            let at = self.matches.iter().position(|m| index.paths[m.idx] == keep);
+            self.selected = at.unwrap_or(0);
+        }
     }
 }
 
@@ -263,6 +287,8 @@ pub struct App {
     pub clip: Option<Clip>,
     pub job: Option<Job>,
     bulk: Option<BulkRename>,
+    /// Recent find indexes by (show_hidden, root), newest first.
+    find_cache: Vec<(bool, Arc<find::Index>)>,
     pub git: Option<Repo>,
     pub message: Option<Message>,
     pub preview: Option<(preview::Key, Preview)>,
@@ -318,6 +344,7 @@ impl App {
             clip: None,
             job: None,
             bulk: None,
+            find_cache: Vec::new(),
             git: None,
             message: None,
             preview: None,
@@ -945,7 +972,12 @@ impl App {
     }
 
     fn open_finder(&mut self) {
-        self.mode = Mode::Find(Finder::open(self.cwd.clone(), self.show_hidden));
+        let cached = self
+            .find_cache
+            .iter()
+            .find(|(hidden, index)| *hidden == self.show_hidden && index.root == self.cwd)
+            .map(|(_, index)| Arc::clone(index));
+        self.mode = Mode::Find(Finder::open(self.cwd.clone(), self.show_hidden, cached));
     }
 
     fn find_key(&mut self, mut finder: Finder, key: KeyEvent) {
@@ -995,9 +1027,14 @@ impl App {
         };
         let failure = match rx.try_recv() {
             Ok(Ok(index)) => {
-                finder.index = Some(index);
+                let index = Arc::new(index);
                 finder.rx = None;
-                finder.rerank();
+                finder.replace_index(Arc::clone(&index));
+                let key = (self.show_hidden, index);
+                self.find_cache
+                    .retain(|(hidden, old)| (*hidden, &old.root) != (key.0, &key.1.root));
+                self.find_cache.insert(0, key);
+                self.find_cache.truncate(FIND_CACHE);
                 return true;
             }
             Ok(Err(e)) => format!("find: {e}"),
@@ -1547,6 +1584,34 @@ mod tests {
         assert!(matches!(app.mode, Mode::Normal));
         assert_eq!(app.cwd, tmp.path().join("src"));
         assert_eq!(app.selected().unwrap().name, "main.rs");
+    }
+
+    #[test]
+    fn reopening_find_uses_the_last_index_then_refreshes_it() {
+        let (tmp, mut app) = setup();
+        let ready = |a: &App| matches!(&a.mode, Mode::Find(f) if !f.indexing());
+        press(&mut app, "f");
+        wait(&mut app, ready);
+        press(&mut app, "\x1b");
+
+        tmp.file("src/new.rs", "");
+        press(&mut app, "f");
+        let Mode::Find(finder) = &app.mode else {
+            panic!("expected the finder")
+        };
+        assert!(finder.index.is_some(), "the cached index is there at once");
+        assert!(finder.indexing(), "and a fresh one is on its way");
+        assert!(!finder.matches.is_empty());
+        press(&mut app, "newrs");
+        wait(&mut app, ready);
+        let Mode::Find(finder) = &app.mode else {
+            panic!("expected the finder")
+        };
+        let index = finder.index.as_ref().unwrap();
+        assert_eq!(
+            index.paths[finder.matches[0].idx], "src/new.rs",
+            "the refresh found it"
+        );
     }
 
     #[test]
