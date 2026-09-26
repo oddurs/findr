@@ -293,6 +293,29 @@ impl Trash {
     }
 }
 
+impl Trash {
+    /// Puts `trashed` back where it came from. If that name has been taken since, it comes
+    /// back beside it as `name copy` rather than overwriting anything.
+    pub fn restore(&self, trashed: &Path, original: &Path) -> io::Result<PathBuf> {
+        let dir = original
+            .parent()
+            .ok_or_else(|| io::Error::other(format!("{} has no parent", original.display())))?;
+        let dest = unique_dest(dir, &name_of(original)?);
+        move_path(trashed, &dest)?;
+        if let Trash::Xdg(root) = self {
+            let info = root
+                .join("info")
+                .join(format!("{}.trashinfo", name_of(trashed)?));
+            match fs::remove_file(&info) {
+                // Another tool may already have cleaned it up; the file is back either way.
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                result => result?,
+            }
+        }
+        Ok(dest)
+    }
+}
+
 fn percent_encode(path: &Path) -> String {
     let mut out = String::new();
     for &b in path.as_os_str().as_encoded_bytes() {
@@ -477,6 +500,33 @@ mod tests {
         assert_eq!(first, tmp.path().join("trash/x.txt"));
         assert_eq!(second, tmp.path().join("trash/x copy.txt"));
         assert!(!tmp.path().join("x.txt").exists());
+    }
+
+    #[test]
+    fn restore_puts_things_back_without_overwriting() {
+        let tmp = TempDir::new();
+        let trash = Trash::Dir(tmp.path().join("trash"));
+        let original = tmp.file("notes.md", "first");
+        let trashed = trash.put(&original).unwrap();
+        assert_eq!(trash.restore(&trashed, &original).unwrap(), original);
+        assert_eq!(fs::read_to_string(&original).unwrap(), "first");
+
+        let trashed = trash.put(&original).unwrap();
+        tmp.file("notes.md", "a new one");
+        let back = trash.restore(&trashed, &original).unwrap();
+        assert_eq!(back, tmp.path().join("notes copy.md"));
+        assert_eq!(fs::read_to_string(&original).unwrap(), "a new one");
+    }
+
+    #[test]
+    fn restoring_from_xdg_removes_the_info() {
+        let tmp = TempDir::new();
+        let trash = Trash::Xdg(tmp.path().join("Trash"));
+        let original = tmp.file("a.txt", "");
+        let trashed = trash.put(&original).unwrap();
+        trash.restore(&trashed, &original).unwrap();
+        assert!(original.exists());
+        assert!(!tmp.path().join("Trash/info/a.txt.trashinfo").exists());
     }
 
     #[test]
