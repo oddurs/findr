@@ -18,7 +18,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a status bar with the mode and anything pending; and a command line that shows the prompt,
   the latest outcome, or the keys that make sense for the selection.
 - A colour system by role, so each colour means one thing, and `--light` for light terminals.
-- Settings in `~/.config/findr/config.toml`: `glyphs`, `theme`, `mouse`.
+- Settings in `~/.config/findr/config.toml`: `glyphs`, `theme`, `mouse`, `hints`, `position`.
+- One quiet bottom bar: a prompt, a question, a message or what is pending on the left, the
+  position on the right, `? for keys` when nothing applies. Key hints are an optional row.
 - Glyphs in three tiers — Nerd Font, Unicode, ASCII — chosen by what is installed and whether
   the terminal is UTF-8, so the screen degrades instead of showing boxes.
 - Narrow terminals drop the parent column, then the preview, before squeezing the list.

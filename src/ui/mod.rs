@@ -18,7 +18,7 @@ use ratatui::widgets::{
 use unicode_width::UnicodeWidthStr;
 
 use crate::app::{App, Areas, Confirm, MessageKind, Mode, count, parent_offset};
-use crate::dir::{self, Entry};
+use crate::dir::{self, Entry, SortKey};
 use crate::icons;
 use crate::preview::{DiffLine, Preview};
 
@@ -28,7 +28,7 @@ mod overlays;
 mod rows;
 pub mod theme;
 
-use components::{badge, chip, empty, facts, hints, message, prompt_label};
+use components::{chip, empty, facts, hints, message, prompt_label};
 use overlays::{draw_find, draw_help};
 use rows::{Row, entry_line, name_style, status};
 use theme::{Theme, Tone};
@@ -46,12 +46,31 @@ struct Regions {
     title: Rect,
     facts: Rect,
     content: Rect,
-    status: Rect,
-    command: Rect,
+    bar: Rect,
+    /// Zero height unless key hints are turned on.
+    hints: Rect,
 }
 
-pub fn draw(frame: &mut Frame, app: &mut App, theme: &Theme) {
-    let r = layout(frame, app, theme);
+/// What the bottom of the screen shows beyond what it must.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Bottom {
+    /// A second row of keys for the selection. Off by default: `?` has them all.
+    pub hints: bool,
+    /// `4 of 10` at the right of the bar.
+    pub position: bool,
+}
+
+impl Default for Bottom {
+    fn default() -> Bottom {
+        Bottom {
+            hints: false,
+            position: true,
+        }
+    }
+}
+
+pub fn draw(frame: &mut Frame, app: &mut App, theme: &Theme, bottom: Bottom) {
+    let r = layout(frame, app, theme, bottom);
     // Recorded so a mouse click can be mapped back to the row under it.
     app.areas = Areas {
         parent: r.context,
@@ -70,8 +89,10 @@ pub fn draw(frame: &mut Frame, app: &mut App, theme: &Theme) {
     if r.content.width > 0 {
         draw_inspector(frame, app, theme, &r);
     }
-    draw_status(frame, app, theme, r.status);
-    draw_command(frame, app, theme, r.command);
+    draw_bar(frame, app, theme, bottom, r.bar);
+    if r.hints.height > 0 {
+        draw_hints(frame, app, theme, r.hints);
+    }
     match &app.mode {
         Mode::Help => draw_help(frame, frame.area(), theme),
         Mode::Find(finder) => draw_find(frame, finder, frame.area(), theme),
@@ -79,12 +100,12 @@ pub fn draw(frame: &mut Frame, app: &mut App, theme: &Theme) {
     }
 }
 
-fn layout(frame: &mut Frame, app: &App, theme: &Theme) -> Regions {
-    let [location, body, status, command] = Layout::vertical([
+fn layout(frame: &mut Frame, app: &App, theme: &Theme, bottom: Bottom) -> Regions {
+    let [location, body, bar, hints] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(1),
         Constraint::Length(1),
-        Constraint::Length(1),
+        Constraint::Length(u16::from(bottom.hints)),
     ])
     .areas(frame.area());
     // Narrow terminals give up the context column first, then the inspector, so the listing
@@ -131,8 +152,8 @@ fn layout(frame: &mut Frame, app: &App, theme: &Theme) -> Regions {
         title,
         facts,
         content,
-        status,
-        command,
+        bar,
+        hints,
     }
 }
 
@@ -456,86 +477,25 @@ fn entry_facts(entry: &Entry, preview: Option<&Preview>, theme: &Theme) -> Vec<S
     facts
 }
 
-/// The mode, what is pending, and where in the listing.
-fn draw_status(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
-    let (label, tone) = match &app.mode {
-        Mode::Normal => ("BROWSE", Tone::Accent),
-        Mode::Filter => ("FILTER", Tone::Accent),
-        Mode::Find(_) => ("FIND", Tone::Accent),
-        Mode::Input(_) => ("PROMPT", Tone::Accent),
-        Mode::Goto => ("GO", Tone::Accent),
-        Mode::Help => ("HELP", Tone::Accent),
-        // The one mode that is about to do something that cannot be taken back.
-        Mode::Confirm(_) => ("CONFIRM", Tone::Danger),
-    };
-    let mut pending = Vec::new();
-    if !app.marked.is_empty() {
-        pending.push(chip(
-            format!("{} marked", app.marked.len()),
-            Tone::Mark,
-            theme,
-        ));
+/// The bar: on the left what is happening now, on the right where you are. It shows only what
+/// applies — a prompt, a question, what just happened, or what is waiting — and is otherwise
+/// nearly empty.
+fn draw_bar(frame: &mut Frame, app: &App, theme: &Theme, bottom: Bottom, area: Rect) {
+    let mut right = Vec::new();
+    if bottom.position && !app.view.is_empty() {
+        let at = format!("{} of {} ", app.selected + 1, app.view.len());
+        right.push(Span::styled(at, theme.muted()));
     }
-    if let Some(job) = &app.job {
-        let text = format!("pasting {}/{}", job.done, job.total);
-        pending.push(chip(text, Tone::Info, theme));
-    }
-    if let Some(clip) = &app.clip {
-        let verb = if clip.cut { "cut" } else { "copied" };
-        pending.push(chip(
-            format!("{} {verb}", count(clip.paths.len())),
-            Tone::Warning,
-            theme,
-        ));
-    }
-    if app.show_hidden {
-        pending.push(chip("hidden shown".into(), Tone::Muted, theme));
-    }
-    let mut left = vec![badge(label, tone, theme)];
-    for chip in pending {
-        left.push(Span::styled("  ", theme.faint()));
-        left.push(chip);
-    }
-
-    let arrow = if app.reverse {
-        theme.glyphs.up
-    } else {
-        theme.glyphs.down
-    };
-    let position = if app.view.is_empty() {
-        0
-    } else {
-        app.selected + 1
-    };
-    let right = facts(
-        &[
-            format!("{}{arrow}", app.sort.label()),
-            format!("{position}/{}", app.view.len()),
-        ],
-        theme,
-    );
-    let mut right = right;
-    right.push(Span::raw(" "));
-    split_line(frame, area, Line::from(left), Line::from(right));
-}
-
-/// One thing at a time: a prompt while typing, else a message just after something happened,
-/// else the keys that make sense now.
-fn draw_command(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
-    let pairs = |p: &[(&'static str, &str)]| -> Vec<(&'static str, String)> {
-        p.iter().map(|(k, l)| (*k, l.to_string())).collect()
-    };
-    let line = match &app.mode {
+    let right = Line::from(right);
+    let left = match &app.mode {
         Mode::Input(input) => {
             let label = prompt_label(input.kind.prompt(), theme);
-            let x =
-                area.x + (label.width() + input.text[..input.byte(input.cursor)].width()) as u16;
-            let prompt = Line::from(vec![label, Span::raw(input.text.clone())]);
-            let keys = Line::from(hints(&pairs(&[("enter", "ok"), ("esc", "cancel")]), theme));
-            split_line(frame, area, prompt, keys);
+            let before_cursor = input.text[..input.byte(input.cursor)].width();
+            let x = area.x + (label.width() + before_cursor) as u16;
             frame.set_cursor_position((x.min(area.right().saturating_sub(1)), area.y));
-            return;
+            Line::from(vec![label, Span::raw(input.text.clone())])
         }
+        // Some things must be on screen: the question being asked and the keys that answer it.
         Mode::Confirm(confirm) => {
             let question = match confirm {
                 Confirm::Trash(paths) => {
@@ -546,45 +506,29 @@ fn draw_command(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
                         ),
                         many => count(many.len()),
                     };
-                    format!(" Move {what} to the trash?   ")
+                    format!(" Move {what} to the Trash?   ")
                 }
                 Confirm::Quit { .. } => " A paste is still running. Quit anyway?   ".into(),
             };
             let mut spans = vec![Span::styled(
                 question,
-                Style::new().fg(theme.danger).add_modifier(Modifier::BOLD),
+                Style::new().add_modifier(Modifier::BOLD),
             )];
-            spans.extend(hints(&pairs(&[("y", "yes"), ("n", "no")]), theme));
+            spans.extend(hints(&owned(&[("y", "yes"), ("n", "no")]), theme));
             Line::from(spans)
         }
-        Mode::Filter => keys(
-            &pairs(&[
-                ("enter", "keep"),
-                ("esc", "clear"),
-                (theme.glyphs.up_down, "move"),
-            ]),
-            theme,
-        ),
-        Mode::Find(_) => keys(
-            &pairs(&[
-                ("enter", "go there"),
-                ("esc", "cancel"),
-                (theme.glyphs.up_down, "move"),
-            ]),
-            theme,
-        ),
-        Mode::Goto => keys(
-            &pairs(&[
+        Mode::Goto => {
+            let mut spans = vec![Span::styled(" go to   ", theme.muted())];
+            let keys = [
                 ("g", "top"),
                 ("h", "home"),
-                ("r", "git root"),
+                ("r", "repository"),
                 ("/", "root"),
-                ("esc", "cancel"),
-            ]),
-            theme,
-        ),
-        Mode::Help => keys(&pairs(&[("any key", "close")]), theme),
-        Mode::Normal => match app.message() {
+            ];
+            spans.extend(hints(&owned(&keys), theme));
+            Line::from(spans)
+        }
+        _ => match app.message() {
             Some(m) => {
                 let tone = match m.kind {
                     MessageKind::Success => Tone::Success,
@@ -593,16 +537,81 @@ fn draw_command(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
                 };
                 message(&m.text, tone, theme)
             }
-            None => keys(&browse_hints(app), theme),
+            None => pending(app, theme, bottom),
         },
     };
-    frame.render_widget(Paragraph::new(line), area);
+    split_line(frame, area, left, right);
 }
 
-fn keys(pairs: &[(&'static str, String)], theme: &Theme) -> Line<'static> {
+/// What is waiting or differs from normal, quietly. Nothing at all when nothing is.
+fn pending(app: &App, theme: &Theme, bottom: Bottom) -> Line<'static> {
+    let g = theme.glyphs;
+    let mut chips: Vec<Vec<Span<'static>>> = Vec::new();
+    if !app.marked.is_empty() {
+        chips.push(vec![
+            chip(g.dot.to_string(), Tone::Mark, theme),
+            Span::styled(format!(" {} marked", app.marked.len()), theme.muted()),
+        ]);
+    }
+    if let Some(job) = &app.job {
+        let text = format!("pasting {} of {}", job.done + 1, job.total);
+        chips.push(vec![chip(text, Tone::Info, theme)]);
+    }
+    if let Some(clip) = &app.clip {
+        let (glyph, verb) = if clip.cut {
+            (g.cut, "to move")
+        } else {
+            (g.copied, "copied")
+        };
+        chips.push(vec![
+            chip(glyph.to_string(), Tone::Warning, theme),
+            Span::styled(format!("{} {verb}", count(clip.paths.len())), theme.muted()),
+        ]);
+    }
+    if app.diff {
+        chips.push(vec![Span::styled("showing diffs", theme.muted())]);
+    }
+    if app.show_hidden {
+        chips.push(vec![Span::styled("showing hidden", theme.muted())]);
+    }
+    // Name, a to z, is what everyone expects; say so only when it is something else.
+    if app.sort != SortKey::Name || app.reverse {
+        let arrow = if app.reverse { g.up } else { g.down };
+        let text = format!("by {} {arrow}", app.sort.label());
+        chips.push(vec![Span::styled(text, theme.muted())]);
+    }
+    if chips.is_empty() && !bottom.hints {
+        // The one pointer to everything else, as quiet as the screen can make it.
+        return Line::from(Span::styled(" ? for keys", theme.faint()));
+    }
     let mut spans = vec![Span::raw(" ")];
-    spans.extend(hints(pairs, theme));
+    for (i, chip) in chips.into_iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw("    "));
+        }
+        spans.extend(chip);
+    }
     Line::from(spans)
+}
+
+/// The optional second row: keys for the selection and the mode.
+fn draw_hints(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
+    let up_down = theme.glyphs.up_down;
+    let pairs = match &app.mode {
+        Mode::Normal => browse_hints(app),
+        Mode::Filter => owned(&[("enter", "keep"), ("esc", "clear"), (up_down, "move")]),
+        Mode::Find(_) => owned(&[("enter", "go there"), ("esc", "cancel"), (up_down, "move")]),
+        Mode::Input(_) => owned(&[("enter", "ok"), ("esc", "cancel")]),
+        Mode::Help => owned(&[("any key", "close")]),
+        Mode::Confirm(_) | Mode::Goto => Vec::new(),
+    };
+    let mut spans = vec![Span::raw(" ")];
+    spans.extend(hints(&pairs, theme));
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+fn owned(pairs: &[(&'static str, &str)]) -> Vec<(&'static str, String)> {
+    pairs.iter().map(|(k, l)| (*k, l.to_string())).collect()
 }
 
 /// What can be done next, given what is selected and what is pending. The full list is `?`.
@@ -651,8 +660,18 @@ mod tests {
     use ratatui::crossterm::event::{KeyCode, KeyEvent};
 
     fn render(app: &mut App, width: u16, height: u16) -> String {
+        render_with(app, width, height, &Theme::DARK, Bottom::default())
+    }
+
+    fn render_with(
+        app: &mut App,
+        width: u16,
+        height: u16,
+        theme: &Theme,
+        bottom: Bottom,
+    ) -> String {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
-        terminal.draw(|f| draw(f, app, &Theme::DARK)).unwrap();
+        terminal.draw(|f| draw(f, app, theme, bottom)).unwrap();
         let buf = terminal.backend().buffer();
         (0..height)
             .map(|y| (0..width).map(|x| buf[(x, y)].symbol()).collect::<String>())
@@ -686,14 +705,14 @@ mod tests {
         // temp dir, so the snapshot takes the body right of the parent column plus the bottom bars.
         let parent = app.areas.parent.width as usize;
         assert!(parent > 0, "wide enough for the parent column");
-        let body = rows[1..rows.len() - 2]
+        let body = rows[1..rows.len() - 1]
             .iter()
             .map(|r| r.chars().skip(parent).collect::<String>());
         let snapshot: Vec<String> = body
-            .chain(rows[rows.len() - 2..].iter().map(|r| r.to_string()))
+            .chain(rows[rows.len() - 1..].iter().map(|r| r.to_string()))
             .collect();
         insta::assert_snapshot!(snapshot.join("\n"));
-        assert_eq!(app.page, 5);
+        assert_eq!(app.page, 6);
     }
 
     #[test]
@@ -780,15 +799,15 @@ mod tests {
         }
         let screen = render(&mut app, 100, 10);
         let rows: Vec<&str> = screen.lines().collect();
-        // Rows: location, seven of body, status, command. The filter is the body's last.
-        let filter_row = rows[7];
+        // Rows: location, eight of body, the bar. The filter is the body's last.
+        let filter_row = rows[8];
         assert!(
             filter_row.contains("/ e"),
             "filter row: {filter_row:?}\n{screen}"
         );
         assert!(filter_row.contains("2 of 3"), "{screen}");
         assert!(!rows[0].contains("/e"), "not in the location bar");
-        assert_eq!(app.areas.current.height, 6, "the listing gives up a row");
+        assert_eq!(app.areas.current.height, 7, "the listing gives up a row");
     }
 
     #[test]
@@ -802,11 +821,8 @@ mod tests {
             "facts row: {}",
             rows[2]
         );
-        let status = rows[rows.len() - 2];
-        assert!(
-            status.contains("BROWSE") && !status.contains("rw-"),
-            "status: {status}"
-        );
+        let bar = rows[rows.len() - 1];
+        assert!(bar.contains("2 of 3") && !bar.contains("rw-"), "bar: {bar}");
     }
 
     #[test]
@@ -815,11 +831,77 @@ mod tests {
         app.marked.insert(tmp.path().join("notes.txt"));
         app.show_hidden = true;
         let screen = render(&mut app, 100, 10);
-        let status = screen.lines().nth(8).unwrap();
+        let bar = screen.lines().last().unwrap();
         assert!(
-            status.contains("1 marked") && status.contains("hidden shown"),
-            "{status}"
+            bar.contains("1 marked") && bar.contains("showing hidden"),
+            "{bar}"
         );
+        assert!(
+            !bar.contains("for keys"),
+            "the pointer gives way to real state"
+        );
+    }
+
+    #[test]
+    fn the_bar_is_quiet_when_nothing_is_happening() {
+        let (_tmp, mut app) = setup();
+        let screen = render(&mut app, 100, 10);
+        let bar = screen.lines().last().unwrap();
+        let words: Vec<&str> = bar.split_whitespace().collect();
+        assert_eq!(words, ["?", "for", "keys", "1", "of", "3"], "bar: {bar:?}");
+    }
+
+    #[test]
+    fn a_sort_other_than_name_says_so() {
+        let (_tmp, mut app) = setup();
+        app.sort = SortKey::Size;
+        let screen = render(&mut app, 100, 10);
+        assert!(
+            screen.lines().last().unwrap().contains("by size"),
+            "{screen}"
+        );
+    }
+
+    #[test]
+    fn hints_and_position_are_settings() {
+        let (_tmp, mut app) = setup();
+        let bottom = Bottom {
+            hints: true,
+            position: false,
+        };
+        let screen = render_with(&mut app, 100, 10, &Theme::DARK, bottom);
+        let rows: Vec<&str> = screen.lines().collect();
+        assert!(
+            rows[9].contains("l open") && rows[9].contains("f find"),
+            "{screen}"
+        );
+        assert!(!rows[8].contains(" of "), "position off: {:?}", rows[8]);
+        assert!(
+            !rows[8].contains("for keys"),
+            "the hints row points to ? already"
+        );
+        assert_eq!(app.page, 7, "the hints row costs the listing a row");
+    }
+
+    #[test]
+    fn an_ascii_terminal_gets_an_ascii_screen() {
+        let (tmp, mut app) = setup();
+        app.marked.insert(tmp.path().join("notes.txt"));
+        let ascii = Theme {
+            glyphs: super::glyphs::Glyphs::ASCII,
+            ..Theme::DARK
+        };
+        for bottom in [
+            Bottom::default(),
+            Bottom {
+                hints: true,
+                position: true,
+            },
+        ] {
+            let screen = render_with(&mut app, 100, 10, &ascii, bottom);
+            let odd: Vec<char> = screen.chars().filter(|c| !c.is_ascii()).collect();
+            assert!(odd.is_empty(), "non-ASCII {odd:?} in\n{screen}");
+        }
     }
 
     #[test]
@@ -847,7 +929,9 @@ mod tests {
         let (_tmp, mut app) = setup();
         let bg = |theme: &Theme, app: &mut App| {
             let mut terminal = Terminal::new(TestBackend::new(100, 10)).unwrap();
-            terminal.draw(|f| draw(f, app, theme)).unwrap();
+            terminal
+                .draw(|f| draw(f, app, theme, Bottom::default()))
+                .unwrap();
             let x = app.areas.current.x + 3;
             terminal.backend().buffer()[(x, app.areas.current.y)].bg
         };

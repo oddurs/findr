@@ -39,6 +39,9 @@ pub struct Glyphs {
     pub minus: &'static str,
     /// Before the branch name, with its trailing space; empty where there is no good symbol.
     pub branch: &'static str,
+    /// Before a count of copied items, and of items cut to move; symbols only a Nerd Font has.
+    pub copied: &'static str,
+    pub cut: &'static str,
     /// How the up and down keys are written in hints.
     pub up_down: &'static str,
     pub rule: &'static str,
@@ -73,6 +76,8 @@ impl Glyphs {
         arrow: "→",
         minus: "−",
         branch: "",
+        copied: "",
+        cut: "",
         up_down: "↑ ↓",
         rule: "│",
         border: border::ROUNDED,
@@ -83,6 +88,8 @@ impl Glyphs {
         success: "\u{f00c}",
         failure: "\u{f00d}",
         branch: "\u{e725} ",
+        copied: "\u{f0c5} ",
+        cut: "\u{f0c4} ",
         ..Glyphs::UNICODE
     };
 
@@ -102,6 +109,8 @@ impl Glyphs {
         arrow: "->",
         minus: "-",
         branch: "",
+        copied: "",
+        cut: "",
         up_down: "up down",
         rule: "|",
         border: ASCII_BORDER,
@@ -236,6 +245,8 @@ mod tests {
             g.arrow,
             g.minus,
             g.branch,
+            g.copied,
+            g.cut,
             g.up_down,
             g.rule,
             g.border.top_left,

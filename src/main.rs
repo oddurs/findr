@@ -158,7 +158,11 @@ fn main() -> ExitCode {
         }));
         capture_mouse();
     }
-    let result = run(&mut terminal, &mut app, mouse, &theme);
+    let bottom = ui::Bottom {
+        hints: config.hints,
+        position: config.position,
+    };
+    let result = run(&mut terminal, &mut app, mouse, &theme, bottom);
     if mouse {
         release_mouse();
     }
@@ -186,12 +190,13 @@ fn run(
     app: &mut App,
     mouse: bool,
     theme: &Theme,
+    bottom: ui::Bottom,
 ) -> io::Result<bool> {
     let mut dirty = true;
     loop {
         app.sync_preview();
         if dirty {
-            terminal.draw(|frame| ui::draw(frame, app, theme))?;
+            terminal.draw(|frame| ui::draw(frame, app, theme, bottom))?;
             dirty = false;
         }
         // Poll quickly only while a worker owes us an answer.

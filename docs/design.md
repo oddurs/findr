@@ -26,10 +26,10 @@ unmistakable.
    supports it and is quieter than it.
 2. **Show state where it applies.** A filter narrows the listing, so it is shown on the
    listing. Facts about the selection belong beside the selection's preview. What belongs to the
-   session (marks, clipboard, a paste in progress) belongs to the status bar.
-3. **Say what can be done next, not everything that can be done.** The bottom line offers the
-   three or four keys that make sense for the selection and the current state. The full list is
-   one `?` away.
+   session (marks, clipboard, a paste in progress) belongs to the bar.
+3. **Say only what applies; keep the rest one key away.** The bar shows what is happening
+   and what is waiting, and nothing when nothing is. Every key is on `?`; a row of keys for
+   the selection is a setting for those who want it.
 4. **Quiet by default, loud on change.** Stable facts are muted. Colour is spent on what differs
    from normal — a modified file, a mark, an error, the cursor.
 5. **One meaning per colour.** A colour that means two things means nothing. Every colour is a
@@ -52,8 +52,8 @@ it; nothing appears in two regions.
  │           │                          │                                              │
  │           │ filter: how it narrows   │                                              │
  └───────────┴──────────────────────────┴──────────────────────────────────────────────┘
- status ─ what mode, what is pending, where in the list
- command ─ type here · what just happened · what I can do next
+ bar ─ what is happening now                                          where I am
+ (hints ─ keys for the selection; off unless asked for)
 ```
 
 | Region | Answers | Holds | Emphasis |
@@ -64,24 +64,33 @@ it; nothing appears in two regions.
 | Listing | What is here, and which one am I on? | Entries, git status, marks, sizes, cursor | **Primary** |
 | Filter | How is the listing narrowed? | The query and the match count, on the listing | Accent while active |
 | Inspector | Is this the one? What changed? | Title, a line of facts, then the content — or, with `D` on a changed file, its diff | Primary content, muted facts |
-| Status | What mode am I in, what is pending? | Mode, marks, clipboard, paste progress, hidden, sort, position | Muted except pending state |
-| Command | What do I type, what happened, what next? | A prompt, or a message, or contextual key hints | Changes by moment |
+| Bar | What is happening, where am I? | Left: a prompt, a question, a message, or what is pending. Right: `4 of 10` | Nearly empty unless something applies |
+| Hints | What can I press? | Keys for the selection — off by default (`hints = true`) | Muted |
 
-The command line holds one thing at a time, in this order of precedence: a **prompt** while
-input is expected, a **message** for a few seconds after something happens, otherwise
-**hints** for the current selection and state.
+The bar's left side holds one thing at a time, in this order of precedence: a **prompt**
+while input is expected, a **question** and its answers, a **message** for a few seconds after
+something happens, otherwise what is **pending** — marks, the clipboard, a paste in progress,
+and any view that differs from the default (diffs on, hidden files shown, a sort other than
+by name). When none of that applies it says only `? for keys`, faintly.
+
+What must be on screen is: a prompt and what you are typing, a question and the keys that
+answer it, the result of what you just did, and anything waiting to act on. Everything else is
+a setting: key hints (`hints`) and position (`position`).
 
 ### Modes
 
 | Mode | Entered by | Input goes to | Shown as |
 | --- | --- | --- | --- |
-| Browse | default | keys act on the selection | badge, hints |
-| Filter | `/` | the filter row on the listing | badge, cursor in the filter row |
-| Find | `f` `^p` | the find overlay | badge, overlay |
-| Prompt | `r` `a` `A` `:` | the command line | badge, prompt |
-| Confirm | `d`, quitting mid-paste | a single `y` | badge, a question with its answers |
-| Go | `g` | the next key | badge, the keys it accepts |
-| Help | `?` | any key closes it | badge, overlay |
+| Browse | default | keys act on the selection | nothing: it is the default |
+| Filter | `/` | the filter row on the listing | the cursor in the filter row |
+| Find | `f` `^p` | the find overlay | the overlay |
+| Prompt | `r` `a` `A` `:` | the bar | the prompt |
+| Confirm | `d`, quitting mid-paste | a single `y` | a question with its answers |
+| Go | `g` | the next key | `go to` and the keys it accepts |
+| Help | `?` | any key closes it | the overlay |
+
+There is no mode badge. Each mode is visible where its input goes; a label repeating it is
+noise.
 
 ## Emphasis
 
@@ -144,9 +153,8 @@ Everything on screen is built from these, in `src/ui/components.rs`:
 
 | Component | Looks like | Used for |
 | --- | --- | --- |
-| **Badge** | ` BROWSE ` on accent; ` CONFIRM ` on danger | The mode |
-| **Chip** | coloured text, spaced apart: `2 marked  1 item copied` | Pending state in the status bar |
-| **Hint** | `y` copy | Keys, in the command line and prompts |
+| **Chip** | a glyph in its role's colour, then muted words, spaced apart: `● 2 marked` | Pending state on the bar |
+| **Hint** | `y` copy | Keys: a question's answers, `go to`, the optional hints row |
 | **Facts** | `Rust · 12 K · 314 lines · 3m ago` | The inspector's second line |
 | **Row** | mark, status, icon, name, size | Every listing: context, listing, inspector, find |
 | **Prompt** | `rename ›` text, with `enter ok   esc cancel` flush right | Any text input |
@@ -182,6 +190,7 @@ What the first versions did, and what changes.
 
 | Where | Before | Problem | After |
 | --- | --- | --- | --- |
+| Bottom rows | A `BROWSE` badge, the default sort, and five key hints, always | The obvious repeated; what mattered (marks, clipboard) lost among it | One bar: what applies now on the left, position on the right; hints a setting |
 | Status bar | Selection facts (mode, size, age, link target) beside session state | Two regions' information in one; size shown twice (status and preview title) | Facts move to the inspector's facts line; the status bar keeps mode and pending state |
 | Command line | A fixed `? help f find / filter q quit` | The same four keys whatever is selected; nothing about marks or a clipboard waiting | Hints follow the selection and state (`p paste here` with a clipboard, `d trash 3` with marks) |
 | Header | The active filter on the far right | Far from the listing it narrows | A filter row on the listing itself, with the match count |

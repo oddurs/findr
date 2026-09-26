@@ -44,7 +44,6 @@ pub struct Theme {
 /// The tones a badge, chip or message can take.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tone {
-    Accent,
     Success,
     Warning,
     Danger,
@@ -90,7 +89,6 @@ impl Theme {
 
     pub fn tone(&self, tone: Tone) -> Color {
         match tone {
-            Tone::Accent => self.accent,
             Tone::Success => self.success,
             Tone::Warning => self.warning,
             Tone::Danger => self.danger,

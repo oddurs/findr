@@ -55,8 +55,9 @@ or run with `--no-icons`.
 findr [PATH] [--cwd-file FILE] [--no-mouse] [--no-icons] [--light]
 ```
 
-`PATH` may be a file, which opens its directory with the cursor on it. The bottom line always
-shows the keys that make sense for what is selected; press `?` for all of them. `--light`
+`PATH` may be a file, which opens its directory with the cursor on it. The bottom bar stays
+quiet — a prompt, a question, what just happened, or what is waiting (marks, the clipboard) —
+and `?` shows every key. `hints = true` in the settings adds a row of keys for the selection. `--light`
 picks colours for a light terminal background. How the screen is organised, and why, is in
 [docs/design.md](docs/design.md).
 While findr has the mouse, most terminals still select text with a modifier held (Option in
@@ -101,6 +102,8 @@ exists. Every setting is optional; flags on the command line win.
 glyphs = "auto"   # "nerd", "unicode" or "ascii"
 theme = "dark"    # or "light"
 mouse = true
+hints = false     # a second row of keys for what is selected
+position = true   # "4 of 10" at the bottom right
 ```
 
 `glyphs = "auto"` uses Nerd Font icons when a Nerd Font is installed, plain Unicode when not,
