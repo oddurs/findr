@@ -578,6 +578,7 @@ fn browse_hints(app: &App) -> Vec<(&'static str, String)> {
         h.push(("y", format!("copy {n}")));
         h.push(("x", format!("cut {n}")));
         h.push(("d", format!("trash {n}")));
+        h.push(("r", format!("rename {n}")));
         h.push(("esc", "unmark".into()));
         return h;
     }
@@ -726,7 +727,13 @@ mod tests {
         app.marked.insert(tmp.path().join("notes.txt"));
         assert_eq!(
             keys(&app),
-            ["y copy 1", "x cut 1", "d trash 1", "esc unmark"]
+            [
+                "y copy 1",
+                "x cut 1",
+                "d trash 1",
+                "r rename 1",
+                "esc unmark"
+            ]
         );
     }
 
