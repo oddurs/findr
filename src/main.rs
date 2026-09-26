@@ -3,6 +3,7 @@ mod dir;
 mod find;
 mod fuzzy;
 mod git;
+mod icons;
 mod ops;
 mod preview;
 mod ui;
@@ -25,11 +26,12 @@ use app::{App, Effect};
 const USAGE: &str = "\
 findr - a terminal file browser for developers
 
-usage: findr [PATH] [--cwd-file FILE] [--no-mouse]
+usage: findr [PATH] [--cwd-file FILE] [--no-mouse] [--no-icons]
 
   PATH             directory to open, or a file to open with the cursor on it
   --cwd-file FILE  on quitting with q, write the final directory to FILE
   --no-mouse       leave the mouse to the terminal, for selecting text
+  --no-icons       no file icons, for a terminal without a Nerd Font
   -h, --help       show this help
   -V, --version    show the version
 
@@ -37,50 +39,54 @@ Press ? inside findr for keys.";
 
 #[derive(Debug, PartialEq)]
 enum Cli {
-    Run {
-        start: PathBuf,
-        cwd_file: Option<PathBuf>,
-        mouse: bool,
-    },
+    Run(Options),
     Help,
     Version,
 }
 
+#[derive(Debug, PartialEq)]
+struct Options {
+    start: PathBuf,
+    cwd_file: Option<PathBuf>,
+    mouse: bool,
+    icons: bool,
+}
+
 fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Cli, String> {
     let mut start = None;
-    let mut cwd_file = None;
-    let mut mouse = true;
+    let mut options = Options {
+        start: PathBuf::from("."),
+        cwd_file: None,
+        mouse: true,
+        icons: true,
+    };
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         match arg.to_str() {
             Some("-h" | "--help") => return Ok(Cli::Help),
             Some("-V" | "--version") => return Ok(Cli::Version),
-            Some("--no-mouse") => mouse = false,
+            Some("--no-mouse") => options.mouse = false,
+            Some("--no-icons") => options.icons = false,
             Some("--cwd-file") => {
-                cwd_file = Some(args.next().ok_or("--cwd-file needs a path")?.into())
+                options.cwd_file = Some(args.next().ok_or("--cwd-file needs a path")?.into())
             }
             Some(s) if s.starts_with("--cwd-file=") => {
-                cwd_file = Some(PathBuf::from(&s["--cwd-file=".len()..]));
+                options.cwd_file = Some(PathBuf::from(&s["--cwd-file=".len()..]));
             }
             Some(s) if s.starts_with('-') => return Err(format!("unknown option {s}")),
             _ if start.is_none() => start = Some(PathBuf::from(arg)),
             _ => return Err("only one PATH may be given".into()),
         }
     }
-    Ok(Cli::Run {
-        start: start.unwrap_or_else(|| PathBuf::from(".")),
-        cwd_file,
-        mouse,
-    })
+    if let Some(start) = start {
+        options.start = start;
+    }
+    Ok(Cli::Run(options))
 }
 
 fn main() -> ExitCode {
-    let (start, cwd_file, mouse) = match parse(std::env::args_os().skip(1)) {
-        Ok(Cli::Run {
-            start,
-            cwd_file,
-            mouse,
-        }) => (start, cwd_file, mouse),
+    let options = match parse(std::env::args_os().skip(1)) {
+        Ok(Cli::Run(options)) => options,
         Ok(Cli::Help) => {
             println!("{USAGE}");
             return ExitCode::SUCCESS;
@@ -94,6 +100,12 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    let Options {
+        start,
+        cwd_file,
+        mouse,
+        icons,
+    } = options;
     let mut app = match App::new(&start, ops::Trash::detect()) {
         Ok(app) => app,
         Err(e) => {
@@ -101,6 +113,7 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    app.icons = icons;
 
     let mut terminal = ratatui::init();
     if mouse {
@@ -216,20 +229,25 @@ mod tests {
 
     #[test]
     fn parses_arguments() {
-        let run = |start: &str, cwd_file: Option<&str>, mouse| {
-            Ok(Cli::Run {
+        let run = |start: &str, cwd_file: Option<&str>, mouse, icons| {
+            Ok(Cli::Run(Options {
                 start: start.into(),
                 cwd_file: cwd_file.map(PathBuf::from),
                 mouse,
-            })
+                icons,
+            }))
         };
-        assert_eq!(args(&[]), run(".", None, true));
+        assert_eq!(args(&[]), run(".", None, true, true));
         assert_eq!(
             args(&["src", "--cwd-file", "/tmp/x"]),
-            run("src", Some("/tmp/x"), true)
+            run("src", Some("/tmp/x"), true, true)
         );
-        assert_eq!(args(&["--cwd-file=/tmp/y"]), run(".", Some("/tmp/y"), true));
-        assert_eq!(args(&["--no-mouse", "src"]), run("src", None, false));
+        assert_eq!(
+            args(&["--cwd-file=/tmp/y"]),
+            run(".", Some("/tmp/y"), true, true)
+        );
+        assert_eq!(args(&["--no-mouse", "src"]), run("src", None, false, true));
+        assert_eq!(args(&["--no-icons"]), run(".", None, true, false));
         assert_eq!(args(&["-h"]), Ok(Cli::Help));
         assert_eq!(args(&["--version"]), Ok(Cli::Version));
         assert!(args(&["--cwd-file"]).is_err());
