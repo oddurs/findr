@@ -12,6 +12,7 @@ use std::time::{Duration, Instant, SystemTime};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::dir::{self, Entry, SortKey};
+use crate::find;
 use crate::fuzzy;
 use crate::git::{self, Repo};
 use crate::ops::{self, Trash};
@@ -32,6 +33,58 @@ pub enum Mode {
     Confirm(Confirm),
     Help,
     Goto,
+    Find(Finder),
+}
+
+/// Rows the finder ranks and keeps; more than fit on any screen.
+pub const FIND_LIMIT: usize = 500;
+
+/// The find-anywhere prompt: a query over an index built on a worker.
+pub struct Finder {
+    pub query: String,
+    pub index: Option<find::Index>,
+    pub matches: Vec<find::Match>,
+    pub selected: usize,
+    rx: Option<Receiver<io::Result<find::Index>>>,
+}
+
+impl Finder {
+    fn open(root: PathBuf, show_hidden: bool) -> Finder {
+        Finder {
+            query: String::new(),
+            index: None,
+            matches: Vec::new(),
+            selected: 0,
+            rx: Some(find::spawn(root, show_hidden)),
+        }
+    }
+
+    pub fn indexing(&self) -> bool {
+        self.rx.is_some()
+    }
+
+    fn rerank(&mut self) {
+        if let Some(index) = &self.index {
+            self.matches = find::rank(index, &self.query, FIND_LIMIT);
+        }
+        self.selected = 0;
+    }
+
+    fn set_query(&mut self, query: String) {
+        self.query = query;
+        self.rerank();
+    }
+
+    fn move_by(&mut self, delta: isize) {
+        let last = self.matches.len().saturating_sub(1);
+        self.selected = self.selected.saturating_add_signed(delta).min(last);
+    }
+
+    fn chosen(&self) -> Option<PathBuf> {
+        let index = self.index.as_ref()?;
+        let m = self.matches.get(self.selected)?;
+        Some(index.root.join(&index.paths[m.idx]))
+    }
 }
 
 pub enum Confirm {
@@ -430,7 +483,8 @@ impl App {
     pub fn pending(&self) -> bool {
         let preview = self.requested.is_some()
             && self.preview.as_ref().map(|(p, _)| p) != self.requested.as_ref();
-        preview || (self.git_pending && self.git_wanted.is_some()) || self.job.is_some()
+        let indexing = matches!(&self.mode, Mode::Find(f) if f.indexing());
+        preview || (self.git_pending && self.git_wanted.is_some()) || self.job.is_some() || indexing
     }
 
     /// Takes finished previews. Returns whether one worth showing arrived.
@@ -499,6 +553,7 @@ impl App {
             Mode::Input(input) => self.input_key(input, key),
             Mode::Confirm(confirm) => return self.confirm_key(confirm, key),
             Mode::Goto => self.goto_key(key),
+            Mode::Find(finder) => self.find_key(finder, key),
             Mode::Help => {}
         }
         None
@@ -509,6 +564,8 @@ impl App {
         let half = (self.page / 2).max(1) as isize;
         match key.code {
             KeyCode::Char('d') if ctrl => self.move_by(half),
+            KeyCode::Char('p') if ctrl => self.open_finder(),
+            KeyCode::Char('f') => self.open_finder(),
             KeyCode::Char('u') if ctrl => self.move_by(-half),
             KeyCode::Char('j') | KeyCode::Down => self.move_by(1),
             KeyCode::Char('k') | KeyCode::Up => self.move_by(-1),
@@ -666,15 +723,87 @@ impl App {
             _ => text.to_string(),
         };
         let path = self.cwd.join(expanded);
-        match std::fs::canonicalize(&path) {
-            Ok(p) if p.is_dir() => self.enter(p, None),
-            Ok(p) => {
-                let name = p.file_name().map(|n| n.to_string_lossy().into_owned());
-                let parent = p.parent().unwrap_or(&p).to_path_buf();
-                self.enter(parent, name);
-            }
-            Err(e) => self.error(format!("{text}: {e}")),
+        if let Err(e) = self.reveal(&path) {
+            self.error(format!("{text}: {e}"));
         }
+    }
+
+    /// Goes to `path`: into it if it is a directory, else to its directory with the cursor on it.
+    fn reveal(&mut self, path: &Path) -> io::Result<()> {
+        let path = std::fs::canonicalize(path)?;
+        if path.is_dir() {
+            self.enter(path, None);
+        } else {
+            let name = path.file_name().map(|n| n.to_string_lossy().into_owned());
+            let parent = path.parent().unwrap_or(&path).to_path_buf();
+            self.enter(parent, name);
+        }
+        Ok(())
+    }
+
+    fn open_finder(&mut self) {
+        self.mode = Mode::Find(Finder::open(self.cwd.clone(), self.show_hidden));
+    }
+
+    fn find_key(&mut self, mut finder: Finder, key: KeyEvent) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Esc => return,
+            KeyCode::Enter => {
+                if let Some(path) = finder.chosen()
+                    && let Err(e) = self.reveal(&path)
+                {
+                    self.error(format!("{}: {e}", path.display()));
+                }
+                return;
+            }
+            KeyCode::Down => finder.move_by(1),
+            KeyCode::Up => finder.move_by(-1),
+            KeyCode::PageDown => finder.move_by(self.page as isize),
+            KeyCode::PageUp => finder.move_by(-(self.page as isize)),
+            KeyCode::Char('n' | 'j') if ctrl => finder.move_by(1),
+            KeyCode::Char('p' | 'k') if ctrl => finder.move_by(-1),
+            KeyCode::Char('u') if ctrl => finder.set_query(String::new()),
+            KeyCode::Char('w') if ctrl => {
+                let keep = finder.query[..word_start(&finder.query)].to_string();
+                finder.set_query(keep);
+            }
+            KeyCode::Backspace => {
+                let mut query = finder.query.clone();
+                query.pop();
+                finder.set_query(query);
+            }
+            KeyCode::Char(c) if !ctrl => {
+                let query = format!("{}{c}", finder.query);
+                finder.set_query(query);
+            }
+            _ => {}
+        }
+        self.mode = Mode::Find(finder);
+    }
+
+    /// Takes the finder's index once the worker has built it. Returns whether it arrived.
+    pub fn poll_find(&mut self) -> bool {
+        let Mode::Find(finder) = &mut self.mode else {
+            return false;
+        };
+        let Some(rx) = &finder.rx else {
+            return false;
+        };
+        let failure = match rx.try_recv() {
+            Ok(Ok(index)) => {
+                finder.index = Some(index);
+                finder.rx = None;
+                finder.rerank();
+                return true;
+            }
+            Ok(Err(e)) => format!("find: {e}"),
+            Err(TryRecvError::Empty) => return false,
+            Err(TryRecvError::Disconnected) => "find: the index stopped unexpectedly".into(),
+        };
+        self.mode = Mode::Normal;
+        self.error(failure);
+        true
     }
 
     fn confirm_key(&mut self, confirm: Confirm, key: KeyEvent) -> Option<Effect> {
@@ -1189,6 +1318,48 @@ mod tests {
         assert_eq!(app.selected().unwrap().name, "app.rs");
     }
 
+    #[test]
+    fn find_jumps_to_a_file_anywhere_below() {
+        let (tmp, mut app) = setup();
+        press(&mut app, "f");
+        assert!(matches!(&app.mode, Mode::Find(f) if f.indexing()));
+        assert!(app.pending());
+        wait(
+            &mut app,
+            |a| matches!(&a.mode, Mode::Find(f) if !f.indexing()),
+        );
+        press(&mut app, "mainrs");
+        let Mode::Find(finder) = &app.mode else {
+            panic!("expected the finder")
+        };
+        let index = finder.index.as_ref().unwrap();
+        assert_eq!(index.paths[finder.matches[0].idx], "src/main.rs");
+        press(&mut app, "\n");
+        assert!(matches!(app.mode, Mode::Normal));
+        assert_eq!(app.cwd, tmp.path().join("src"));
+        assert_eq!(app.selected().unwrap().name, "main.rs");
+    }
+
+    #[test]
+    fn find_can_jump_into_a_directory_or_be_cancelled() {
+        let (tmp, mut app) = setup();
+        app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
+        wait(
+            &mut app,
+            |a| matches!(&a.mode, Mode::Find(f) if !f.indexing()),
+        );
+        press(&mut app, "\x1b");
+        assert!(matches!(app.mode, Mode::Normal));
+        assert_eq!(app.cwd, tmp.path());
+        press(&mut app, "f");
+        wait(
+            &mut app,
+            |a| matches!(&a.mode, Mode::Find(f) if !f.indexing()),
+        );
+        press(&mut app, "src/\n");
+        assert_eq!(app.cwd, tmp.path().join("src"));
+    }
+
     /// Polls the workers until `done` holds.
     fn wait(app: &mut App, done: impl Fn(&App) -> bool) {
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -1197,6 +1368,7 @@ mod tests {
             app.poll_preview();
             app.poll_git();
             app.poll_job();
+            app.poll_find();
             std::thread::sleep(Duration::from_millis(5));
         }
     }
