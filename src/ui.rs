@@ -11,7 +11,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::app::{App, Confirm, FIND_LIMIT, Finder, Mode};
+use crate::app::{App, Areas, Confirm, FIND_LIMIT, Finder, Mode, parent_offset};
 use crate::dir::{self, Entry};
 use crate::git::{Repo, Status};
 use crate::preview::Preview;
@@ -31,7 +31,7 @@ const HELP: &[(&str, &str)] = &[
     ("-", "previous directory"),
     (":", "go to a path"),
     ("/", "fuzzy filter"),
-    ("f ^p", "find anywhere below (honours .gitignore)"),
+    ("f ^p", "find below (honours .gitignore)"),
     ("esc", "clear filter, then marks"),
     ("space", "mark"),
     ("y x p", "copy, cut, paste"),
@@ -47,6 +47,7 @@ const HELP: &[(&str, &str)] = &[
     ("s S", "cycle sort, reverse"),
     ("R", "reload"),
     ("q Q", "quit and cd, quit"),
+    ("mouse", "wheel, click, double-click to open"),
 ];
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
@@ -63,6 +64,20 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Constraint::Percentage(45),
     ])
     .areas(body);
+
+    let current = column(frame, current);
+    let preview = column(frame, preview);
+    let preview = Rect {
+        x: preview.x + 1,
+        width: preview.width.saturating_sub(1),
+        ..preview
+    };
+    // Recorded so a mouse click can be mapped back to the row under it.
+    app.areas = Areas {
+        parent,
+        current,
+        preview,
+    };
 
     draw_header(frame, app, header);
     draw_parent(frame, app, parent);
@@ -125,9 +140,7 @@ fn draw_parent(frame: &mut Frame, app: &App, area: Rect) {
     let height = area.height as usize;
     let width = area.width as usize;
     let sel = app.parent_selected.unwrap_or(0);
-    let offset = sel
-        .saturating_sub(height / 2)
-        .min(app.parent.len().saturating_sub(height));
+    let offset = parent_offset(sel, app.parent.len(), height);
     let lines: Vec<Line> = app.parent[offset..]
         .iter()
         .take(height)
@@ -144,8 +157,7 @@ fn draw_parent(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(lines), area);
 }
 
-fn draw_current(frame: &mut Frame, app: &mut App, area: Rect) {
-    let inner = column(frame, area);
+fn draw_current(frame: &mut Frame, app: &mut App, inner: Rect) {
     let height = (inner.height as usize).max(1);
     app.page = height;
     if app.view.is_empty() {
@@ -190,13 +202,7 @@ fn draw_current(frame: &mut Frame, app: &mut App, area: Rect) {
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
-fn draw_preview(frame: &mut Frame, app: &App, area: Rect) {
-    let inner = column(frame, area);
-    let inner = Rect {
-        x: inner.x + 1,
-        width: inner.width.saturating_sub(1),
-        ..inner
-    };
+fn draw_preview(frame: &mut Frame, app: &App, inner: Rect) {
     let Some(selected) = app.selected() else {
         return;
     };

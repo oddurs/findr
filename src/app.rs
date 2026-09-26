@@ -9,7 +9,10 @@ use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
-use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::crossterm::event::{
+    KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
+use ratatui::layout::{Position, Rect};
 
 use crate::dir::{self, Entry, SortKey};
 use crate::find;
@@ -19,6 +22,9 @@ use crate::ops::{self, Trash};
 use crate::preview::{self, Preview};
 
 const MESSAGE_TTL: Duration = Duration::from_secs(4);
+/// Two clicks on the same row this close together open it, as in Finder.
+const DOUBLE_CLICK: Duration = Duration::from_millis(400);
+const WHEEL_STEP: isize = 3;
 const PREVIEW_STEP: usize = 3;
 
 pub struct ViewItem {
@@ -202,6 +208,21 @@ pub struct Message {
     at: Instant,
 }
 
+/// Where the last draw put each column, so a click can be mapped to a row.
+#[derive(Default, Clone, Copy)]
+pub struct Areas {
+    pub parent: Rect,
+    pub current: Rect,
+    pub preview: Rect,
+}
+
+/// The first parent-column row shown: the current directory kept near the middle.
+pub fn parent_offset(selected: usize, len: usize, height: usize) -> usize {
+    selected
+        .saturating_sub(height / 2)
+        .min(len.saturating_sub(height))
+}
+
 /// Work that needs the terminal, which `main` owns.
 pub enum Effect {
     Quit { write_cwd: bool },
@@ -230,6 +251,8 @@ pub struct App {
     pub preview_scroll: usize,
     /// Rows in the file list, recorded by the last draw; drives page movement.
     pub page: usize,
+    pub areas: Areas,
+    last_click: Option<(Instant, PathBuf)>,
     back: Vec<PathBuf>,
     cursors: HashMap<PathBuf, String>,
     cwd_mtime: Option<SystemTime>,
@@ -277,6 +300,8 @@ impl App {
             preview: None,
             preview_scroll: 0,
             page: 20,
+            areas: Areas::default(),
+            last_click: None,
             back: Vec::new(),
             cursors: HashMap::new(),
             cwd_mtime: None,
@@ -555,6 +580,67 @@ impl App {
             Mode::Goto => self.goto_key(key),
             Mode::Find(finder) => self.find_key(finder, key),
             Mode::Help => {}
+        }
+        None
+    }
+
+    /// Wheel scrolls the list (or the preview under the pointer), a click selects, a double
+    /// click opens. The parent column and a directory preview navigate on a single click,
+    /// since what they show is somewhere to go rather than something to select.
+    pub fn handle_mouse(&mut self, mouse: MouseEvent) -> Option<Effect> {
+        if !matches!(self.mode, Mode::Normal) {
+            return None;
+        }
+        let at = Position::new(mouse.column, mouse.row);
+        let row = |area: Rect| (mouse.row - area.y) as usize;
+        let areas = self.areas;
+        match mouse.kind {
+            MouseEventKind::ScrollDown if areas.preview.contains(at) => {
+                self.scroll_preview(WHEEL_STEP)
+            }
+            MouseEventKind::ScrollUp if areas.preview.contains(at) => {
+                self.scroll_preview(-WHEEL_STEP)
+            }
+            MouseEventKind::ScrollDown => self.move_by(WHEEL_STEP),
+            MouseEventKind::ScrollUp => self.move_by(-WHEEL_STEP),
+            MouseEventKind::Down(MouseButton::Left) if areas.current.contains(at) => {
+                let index = self.offset + row(areas.current);
+                let path = self
+                    .view
+                    .get(index)
+                    .map(|v| self.entries[v.idx].path.clone())?;
+                let now = Instant::now();
+                let double = self
+                    .last_click
+                    .take()
+                    .is_some_and(|(then, last)| last == path && now - then < DOUBLE_CLICK);
+                self.selected = index;
+                if double {
+                    return self.open();
+                }
+                self.last_click = Some((now, path));
+            }
+            MouseEventKind::Down(MouseButton::Left) if areas.parent.contains(at) => {
+                let height = areas.parent.height as usize;
+                let selected = self.parent_selected.unwrap_or(0);
+                let offset = parent_offset(selected, self.parent.len(), height);
+                let entry = self.parent.get(offset + row(areas.parent))?;
+                let (path, name, is_dir) = (entry.path.clone(), entry.name.clone(), entry.is_dir);
+                if is_dir {
+                    self.enter(path, None);
+                } else if let Some(parent) = self.cwd.parent().map(Path::to_path_buf) {
+                    self.enter(parent, Some(name));
+                }
+            }
+            MouseEventKind::Down(MouseButton::Left) if areas.preview.contains(at) => {
+                let Some((dir, Preview::Dir(entries))) = &self.preview else {
+                    return None;
+                };
+                let entry = entries.get(self.preview_scroll + row(areas.preview))?;
+                let (dir, name) = (dir.clone(), entry.name.clone());
+                self.enter(dir, Some(name));
+            }
+            _ => {}
         }
         None
     }
@@ -1114,6 +1200,7 @@ fn count(n: usize) -> String {
 mod tests {
     use super::*;
     use crate::dir::testutil::TempDir;
+    use ratatui::text::Line;
     use std::fs;
 
     fn key(code: KeyCode) -> KeyEvent {
@@ -1431,6 +1518,97 @@ mod tests {
         let (_tmp, mut app) = setup();
         app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::ALT));
         assert_eq!(app.selected, 0);
+    }
+
+    fn click(app: &mut App, column: u16, row: u16) -> Option<Effect> {
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        })
+    }
+
+    /// A 60x10 screen: parent at columns 0–9, current 10–29, preview 30–59, rows 1–8.
+    fn with_areas(app: &mut App) {
+        app.areas = Areas {
+            parent: Rect::new(0, 1, 10, 8),
+            current: Rect::new(11, 1, 19, 8),
+            preview: Rect::new(32, 1, 28, 8),
+        };
+    }
+
+    #[test]
+    fn click_selects_and_double_click_opens() {
+        let (tmp, mut app) = setup();
+        with_areas(&mut app);
+        assert!(click(&mut app, 15, 2).is_none());
+        assert_eq!(app.selected().unwrap().name, "Cargo.toml");
+        click(&mut app, 15, 1);
+        assert_eq!(app.selected().unwrap().name, "src");
+        assert_eq!(app.cwd, tmp.path(), "one click only selects");
+        click(&mut app, 15, 1);
+        assert_eq!(
+            app.cwd,
+            tmp.path().join("src"),
+            "a second click on the same row opens"
+        );
+        // Below the last entry: nothing to select.
+        click(&mut app, 15, 7);
+        assert_eq!(app.selected().unwrap().name, "app.rs");
+    }
+
+    #[test]
+    fn a_double_click_on_a_file_edits_it() {
+        let (_tmp, mut app) = setup();
+        with_areas(&mut app);
+        click(&mut app, 15, 2);
+        assert!(matches!(click(&mut app, 15, 2), Some(Effect::Run(_))));
+    }
+
+    #[test]
+    fn wheel_moves_the_list_or_scrolls_the_preview() {
+        let (_tmp, mut app) = setup();
+        with_areas(&mut app);
+        let wheel = |app: &mut App, kind, column| {
+            app.handle_mouse(MouseEvent {
+                kind,
+                column,
+                row: 2,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+        wheel(&mut app, MouseEventKind::ScrollDown, 15);
+        assert_eq!(app.selected, 2, "clamped at the last entry");
+        wheel(&mut app, MouseEventKind::ScrollUp, 15);
+        assert_eq!(app.selected, 0);
+        app.preview = Some((app.cwd.clone(), Preview::Text(vec![Line::raw("x"); 10])));
+        wheel(&mut app, MouseEventKind::ScrollDown, 40);
+        assert_eq!(app.preview_scroll, WHEEL_STEP as usize);
+        assert_eq!(app.selected, 0, "the list stays put under a preview scroll");
+    }
+
+    #[test]
+    fn clicking_the_parent_or_a_directory_preview_navigates() {
+        let (tmp, mut app) = setup();
+        with_areas(&mut app);
+        app.sync_preview();
+        wait(&mut app, |a| a.preview.is_some());
+        // The preview of src lists app.rs then main.rs.
+        click(&mut app, 40, 2);
+        assert_eq!(app.cwd, tmp.path().join("src"));
+        assert_eq!(app.selected().unwrap().name, "main.rs");
+        // In the parent column the top row is src's parent's first entry: src itself.
+        click(&mut app, 3, 1);
+        assert_eq!(app.cwd, tmp.path().join("src"));
+        let row = app
+            .parent
+            .iter()
+            .position(|e| e.name == "README.md")
+            .unwrap() as u16;
+        click(&mut app, 3, 1 + row);
+        assert_eq!(app.cwd, tmp.path());
+        assert_eq!(app.selected().unwrap().name, "README.md");
     }
 
     #[test]
