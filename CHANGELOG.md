@@ -12,9 +12,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Three-column browser: parent, current directory, and a preview built on a
   background thread.
 - Nerd Font file-type icons in every listing and in find; `--no-icons` turns them off.
-- A header with the branch, a dirty marker and ahead/behind counts; a status bar with the
-  mode, coloured permissions, and marks, clipboard and paste progress; a title over the
-  preview naming the file, its language and size; a scrollbar on long listings.
+- A screen organised by what each part answers (see `docs/design.md`): location and
+  repository state along the top; an inspector that names the selection and gives its facts
+  (kind, size, lines, age, mode) above its content; a filter row on the listing it narrows;
+  a status bar with the mode and anything pending; and a command line that shows the prompt,
+  the latest outcome, or the keys that make sense for the selection.
+- A colour system by role, so each colour means one thing, and `--light` for light terminals.
 - Narrow terminals drop the parent column, then the preview, before squeezing the list.
 - Syntax-highlighted file previews, directory previews, and notes for binary and
   empty files.

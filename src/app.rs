@@ -124,10 +124,10 @@ pub enum InputKind {
 impl InputKind {
     pub fn prompt(&self) -> &'static str {
         match self {
-            InputKind::Rename(_) => "rename: ",
-            InputKind::NewFile => "new file: ",
-            InputKind::NewDir => "new directory: ",
-            InputKind::Jump => "go to: ",
+            InputKind::Rename(_) => "rename",
+            InputKind::NewFile => "new file",
+            InputKind::NewDir => "new directory",
+            InputKind::Jump => "go to",
         }
     }
 }
@@ -202,9 +202,18 @@ pub struct Clip {
     pub cut: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MessageKind {
+    /// Something to know: a toggle's new state, a cancelled prompt.
+    Info,
+    /// Something that was asked for and happened.
+    Success,
+    Error,
+}
+
 pub struct Message {
     pub text: String,
-    pub error: bool,
+    pub kind: MessageKind,
     at: Instant,
 }
 
@@ -331,20 +340,24 @@ impl App {
             .filter(|m| m.at.elapsed() < MESSAGE_TTL)
     }
 
-    fn info(&mut self, text: impl Into<String>) {
+    fn say(&mut self, kind: MessageKind, text: impl Into<String>) {
         self.message = Some(Message {
             text: text.into(),
-            error: false,
+            kind,
             at: Instant::now(),
         });
     }
 
+    fn info(&mut self, text: impl Into<String>) {
+        self.say(MessageKind::Info, text);
+    }
+
+    fn success(&mut self, text: impl Into<String>) {
+        self.say(MessageKind::Success, text);
+    }
+
     fn error(&mut self, text: impl Into<String>) {
-        self.message = Some(Message {
-            text: text.into(),
-            error: true,
-            at: Instant::now(),
-        });
+        self.say(MessageKind::Error, text);
     }
 
     /// Lists `dir` and makes it current, with the cursor on `select` or wherever it last was there.
@@ -791,16 +804,26 @@ impl App {
         if text.is_empty() {
             return;
         }
-        let created = match input.kind {
-            InputKind::Rename(from) => ops::rename(&from, text).map(|()| text.to_string()),
-            InputKind::NewFile => ops::create(&self.cwd, text, false),
-            InputKind::NewDir => ops::create(&self.cwd, text, true),
+        let (created, done) = match input.kind {
+            InputKind::Rename(from) => (
+                ops::rename(&from, text).map(|()| text.to_string()),
+                format!("renamed to {text}"),
+            ),
+            InputKind::NewFile => (
+                ops::create(&self.cwd, text, false),
+                format!("created {text}"),
+            ),
+            InputKind::NewDir => (
+                ops::create(&self.cwd, text, true),
+                format!("created {text}/"),
+            ),
             InputKind::Jump => return self.jump(text),
         };
         match created {
             Ok(name) => {
                 self.reload_selecting(Some(name));
                 self.sync_git(true);
+                self.success(done);
             }
             Err(e) => self.error(e.to_string()),
         }
@@ -1045,8 +1068,8 @@ impl App {
         }
         let text: Vec<_> = paths.iter().map(|p| p.to_string_lossy()).collect();
         match ops::copy_to_clipboard(&text.join("\n")) {
-            Ok(()) if paths.len() == 1 => self.info(format!("copied {}", text[0])),
-            Ok(()) => self.info(format!("copied {} paths", paths.len())),
+            Ok(()) if paths.len() == 1 => self.success(format!("copied {}", text[0])),
+            Ok(()) => self.success(format!("copied {} paths", paths.len())),
             Err(e) => self.error(e.to_string()),
         }
     }
@@ -1157,7 +1180,7 @@ impl App {
         let done = pasted.done;
         match pasted.failure {
             Some(f) => self.error(format!("pasted {done} of {total}: {f}")),
-            None => self.info(format!("pasted {}", count(done))),
+            None => self.success(format!("pasted {}", count(done))),
         }
     }
 
@@ -1186,12 +1209,12 @@ impl App {
         self.sync_git(true);
         match failure {
             Some(f) => self.error(format!("trashed {done} of {}: {f}", paths.len())),
-            None => self.info(format!("moved {} to trash", count(done))),
+            None => self.success(format!("moved {} to the trash", count(done))),
         }
     }
 }
 
-fn count(n: usize) -> String {
+pub(crate) fn count(n: usize) -> String {
     if n == 1 {
         "1 item".into()
     } else {
@@ -1303,7 +1326,7 @@ mod tests {
         press(&mut app, "Abuild\n");
         assert!(tmp.path().join("build").is_dir());
         press(&mut app, "aREADME.md\n");
-        assert!(app.message().unwrap().error);
+        assert_eq!(app.message().unwrap().kind, MessageKind::Error);
     }
 
     #[test]
@@ -1381,7 +1404,7 @@ mod tests {
         let (tmp, mut app) = setup();
         press(&mut app, "ylp");
         wait(&mut app, |a| a.job.is_none());
-        assert!(app.message().unwrap().error);
+        assert_eq!(app.message().unwrap().kind, MessageKind::Error);
         assert!(!tmp.path().join("src/src").exists());
     }
 

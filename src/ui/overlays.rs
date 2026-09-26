@@ -2,13 +2,14 @@
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Clear, Paragraph};
+use ratatui::widgets::{Clear, Paragraph};
 use unicode_width::UnicodeWidthStr;
 
-use super::rows::find_line;
-use super::{ACCENT, DIM, SELECTED};
+use super::components::panel;
+use super::rows::{Row, find_line};
+use super::theme::Theme;
 use crate::app::{FIND_LIMIT, Finder};
 
 pub(super) enum Help {
@@ -50,7 +51,7 @@ pub(super) const HELP: &[Help] = &[
     Help::Key("q Q", "quit and cd, quit"),
 ];
 
-pub(super) fn draw_help(frame: &mut Frame, area: Rect) {
+pub(super) fn draw_help(frame: &mut Frame, area: Rect, theme: &Theme) {
     // Flow into more columns when the terminal is too short for one.
     let rows = (area.height.saturating_sub(2) as usize).max(1);
     let columns = HELP.len().div_ceil(rows);
@@ -72,7 +73,9 @@ pub(super) fn draw_help(frame: &mut Frame, area: Rect) {
             (keys, cells.max().unwrap_or(0))
         })
         .collect();
-    let heading = Style::new().fg(ACCENT).add_modifier(Modifier::BOLD);
+    let heading = Style::new().fg(theme.accent).add_modifier(Modifier::BOLD);
+    // Keys look as they do in the command line's hints: bold, in the normal colour.
+    let key = Style::new().add_modifier(Modifier::BOLD);
     let lines: Vec<Line> = (0..rows)
         .map(|r| {
             let cells = widths
@@ -87,7 +90,7 @@ pub(super) fn draw_help(frame: &mut Frame, area: Rect) {
                     )]
                 }
                 Help::Key(k, d) => vec![
-                    Span::styled(format!(" {k:<keys$}  "), Style::new().fg(Color::Yellow)),
+                    Span::styled(format!(" {k:<keys$}  "), key),
                     Span::raw(format!("{d:<w$} ", w = cell - keys - 4)),
                 ],
             });
@@ -97,26 +100,21 @@ pub(super) fn draw_help(frame: &mut Frame, area: Rect) {
     let width = widths.iter().map(|(_, cell)| cell).sum::<usize>() as u16 + 2;
     let popup = centered(area, width, rows as u16 + 2);
     frame.render_widget(Clear, popup);
-    frame.render_widget(Paragraph::new(lines).block(popup_block(" keys ")), popup);
+    frame.render_widget(Paragraph::new(lines).block(panel("keys", theme)), popup);
 }
 
-/// The frame every overlay shares.
-pub(super) fn popup_block(title: &str) -> Block<'static> {
-    Block::bordered()
-        .border_type(BorderType::Rounded)
-        .border_style(DIM)
-        .title(Span::styled(
-            title.to_string(),
-            Style::new().fg(ACCENT).add_modifier(Modifier::BOLD),
-        ))
-}
-
-pub(super) fn draw_find(frame: &mut Frame, finder: &Finder, area: Rect, icons: bool) {
+pub(super) fn draw_find(
+    frame: &mut Frame,
+    finder: &Finder,
+    area: Rect,
+    icons: bool,
+    theme: &Theme,
+) {
     let width = (area.width * 9 / 10).max(20);
     let height = (area.height * 8 / 10).max(5);
     let popup = centered(area, width, height);
     frame.render_widget(Clear, popup);
-    let block = popup_block(" find ");
+    let block = panel("find", theme);
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
     if inner.height < 2 {
@@ -147,11 +145,14 @@ pub(super) fn draw_find(frame: &mut Frame, finder: &Finder, area: Rect, icons: b
     ])
     .areas(Rect { height: 1, ..inner });
     let prompt = Line::from(vec![
-        Span::styled(" › ", Style::new().fg(Color::Cyan)),
+        Span::styled(" › ", Style::new().fg(theme.accent)),
         Span::raw(finder.query.clone()),
     ]);
     frame.render_widget(Paragraph::new(prompt), prompt_area);
-    frame.render_widget(Paragraph::new(Span::styled(count, DIM)), count_area);
+    frame.render_widget(
+        Paragraph::new(Span::styled(count, theme.muted())),
+        count_area,
+    );
     let cursor = prompt_area.x + 3 + finder.query.width() as u16;
     frame.set_cursor_position((cursor.min(prompt_area.right().saturating_sub(1)), inner.y));
 
@@ -166,6 +167,13 @@ pub(super) fn draw_find(frame: &mut Frame, finder: &Finder, area: Rect, icons: b
     let height = rows.height as usize;
     // Keep the selection in view; the list is short enough to recompute every frame.
     let offset = finder.selected.saturating_sub(height.saturating_sub(1));
+    let row = Row {
+        theme,
+        width: rows.width as usize,
+        size: false,
+        icons,
+        muted: false,
+    };
     let lines: Vec<Line> = finder
         .matches
         .iter()
@@ -173,9 +181,9 @@ pub(super) fn draw_find(frame: &mut Frame, finder: &Finder, area: Rect, icons: b
         .skip(offset)
         .take(height)
         .map(|(i, m)| {
-            let line = find_line(&index.paths[m.idx], &m.hits, rows.width as usize, icons);
+            let line = find_line(&index.paths[m.idx], &m.hits, &row);
             if i == finder.selected {
-                line.patch_style(SELECTED)
+                line.patch_style(theme.selected())
             } else {
                 line
             }
