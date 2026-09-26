@@ -9,64 +9,35 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, BorderType, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
+    Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
 };
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_width::UnicodeWidthStr;
 
-use crate::app::{App, Areas, Confirm, FIND_LIMIT, Finder, Mode, parent_offset};
-use crate::dir::{self, Entry};
-use crate::git::{Repo, Status};
+use crate::app::{App, Areas, Confirm, Mode, parent_offset};
+use crate::dir;
 use crate::icons;
 use crate::preview::Preview;
+
+mod overlays;
+mod rows;
+
+use overlays::{draw_find, draw_help};
+use rows::{entry_line, name_style, status};
 
 const SELECTED: Style = Style::new()
     .bg(Color::Indexed(237))
     .add_modifier(Modifier::BOLD);
+
 const PARENT_SELECTED: Style = Style::new().bg(Color::Indexed(236));
+
 const DIM: Style = Style::new().fg(Color::DarkGray);
+
 const ACCENT: Color = Color::Blue;
+
 /// Below this width the parent column goes; below the next, the preview does too.
 const WITH_PARENT: u16 = 90;
+
 const WITH_PREVIEW: u16 = 60;
-
-enum Help {
-    Section(&'static str),
-    Key(&'static str, &'static str),
-}
-
-const HELP: &[Help] = &[
-    Help::Section("Move"),
-    Help::Key("j k  ↑ ↓", "down, up"),
-    Help::Key("h l  ← →", "parent, open"),
-    Help::Key("enter", "enter directory or edit file"),
-    Help::Key("gg G  ^d ^u", "top, bottom, half page"),
-    Help::Key("gh gr g/", "home, git root, root"),
-    Help::Key("-", "previous directory"),
-    Help::Key(":", "go to a path"),
-    Help::Section("Find"),
-    Help::Key("/", "fuzzy filter this directory"),
-    Help::Key("f ^p", "find below, per .gitignore"),
-    Help::Key("esc", "clear filter, then marks"),
-    Help::Section("Files"),
-    Help::Key("space", "mark"),
-    Help::Key("y x p", "copy, cut, paste"),
-    Help::Key("d", "move to trash"),
-    Help::Key("r", "rename"),
-    Help::Key("a A", "new file or path, new dir"),
-    Help::Key("c", "copy path to clipboard"),
-    Help::Section("Open"),
-    Help::Key("e", "edit in $EDITOR"),
-    Help::Key("o", "open with the default app"),
-    Help::Key("!", "shell here"),
-    Help::Section("View"),
-    Help::Key("J K", "scroll preview"),
-    Help::Key(".", "show hidden files"),
-    Help::Key("s S", "cycle sort, reverse"),
-    Help::Key("R", "reload"),
-    Help::Key("mouse", "wheel, click, double-click"),
-    Help::Section("Quit"),
-    Help::Key("q Q", "quit and cd, quit"),
-];
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let [header, body, status, command] = Layout::vertical([
@@ -351,133 +322,6 @@ fn draw_preview(frame: &mut Frame, app: &App, inner: Rect) {
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
-fn status(git: Option<&Repo>, entry: &Entry) -> Option<Status> {
-    git?.status_of(&entry.path)
-}
-
-fn status_style(status: Status) -> Style {
-    let color = match status {
-        Status::Modified => Color::Yellow,
-        Status::Added => Color::Green,
-        Status::Renamed => Color::Cyan,
-        Status::Deleted | Status::Conflicted => Color::Red,
-        Status::Untracked => Color::LightRed,
-        Status::Ignored => Color::DarkGray,
-    };
-    Style::new().fg(color)
-}
-
-fn name_style(entry: &Entry, status: Option<Status>) -> Style {
-    let style = match (entry.is_symlink, entry.is_dir) {
-        (true, true) => Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-        (true, false) => Style::new().fg(Color::Cyan),
-        (false, true) => Style::new().fg(Color::Blue).add_modifier(Modifier::BOLD),
-        (false, false) if entry.is_executable() => Style::new().fg(Color::Green),
-        (false, false) => Style::new(),
-    };
-    if entry.is_hidden() || status == Some(Status::Ignored) {
-        style.add_modifier(Modifier::DIM)
-    } else {
-        style
-    }
-}
-
-/// One row: mark, git status, name (truncated, match positions highlighted), size flush right.
-fn entry_line(
-    entry: &Entry,
-    hits: &[usize],
-    status: Option<Status>,
-    marked: bool,
-    width: usize,
-    with_size: bool,
-    icons: bool,
-) -> Line<'static> {
-    let mut spans = vec![
-        if marked {
-            Span::styled("▍", Style::new().fg(Color::Magenta))
-        } else {
-            Span::raw(" ")
-        },
-        match status {
-            Some(s) => Span::styled(s.symbol().to_string(), status_style(s)),
-            None => Span::raw(" "),
-        },
-        Span::raw(" "),
-    ];
-    let size = if with_size && !entry.is_dir {
-        dir::human_size(entry.size)
-    } else {
-        String::new()
-    };
-    let base = name_style(entry, status);
-    // The glyph plus a space: Nerd Font icons are drawn wider than a cell and need the room.
-    let icon_width = if icons { 2 } else { 0 };
-    if icons {
-        let icon = icons::for_entry(entry);
-        let style = Style::new().fg(icon.color).add_modifier(base.add_modifier);
-        spans.push(Span::styled(format!("{} ", icon.glyph), style));
-    }
-    let gutter = 3 + icon_width;
-    let reserved = gutter + if size.is_empty() { 0 } else { size.len() + 1 };
-    let room = width.saturating_sub(reserved);
-    let mut name = entry.name.clone();
-    if entry.is_dir {
-        name.push('/');
-    }
-    let hit = base.fg(Color::Yellow).add_modifier(Modifier::BOLD);
-    let used = push_name(&mut spans, &name, hits, base, hit, room);
-    if !size.is_empty() {
-        let pad = width.saturating_sub(gutter + used + size.len());
-        spans.push(Span::raw(" ".repeat(pad)));
-        spans.push(Span::styled(size, DIM));
-    }
-    Line::from(spans)
-}
-
-/// Pushes `name` cut to `room` columns, styling the characters at `hits`. Returns columns used.
-fn push_name(
-    spans: &mut Vec<Span<'static>>,
-    name: &str,
-    hits: &[usize],
-    base: Style,
-    hit: Style,
-    room: usize,
-) -> usize {
-    let total = name.width();
-    let limit = if total > room {
-        room.saturating_sub(1)
-    } else {
-        room
-    };
-    let mut hits = hits.iter().peekable();
-    let (mut used, mut run, mut run_hit) = (0, String::new(), false);
-    for (i, c) in name.chars().enumerate() {
-        let c = if c.is_control() { '?' } else { c };
-        let w = c.width().unwrap_or(0);
-        if used + w > limit {
-            break;
-        }
-        let is_hit = hits.next_if(|&&h| h == i).is_some();
-        if is_hit != run_hit && !run.is_empty() {
-            spans.push(Span::styled(
-                std::mem::take(&mut run),
-                if run_hit { hit } else { base },
-            ));
-        }
-        run_hit = is_hit;
-        run.push(c);
-        used += w;
-    }
-    if !run.is_empty() {
-        spans.push(Span::styled(run, if run_hit { hit } else { base }));
-    }
-    if total > room && room > 0 {
-        spans.push(Span::styled("…", base));
-        used += 1;
-    }
-    used
-}
-
 fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
     let (label, color) = match &app.mode {
         Mode::Normal => ("NORMAL", ACCENT),
@@ -640,226 +484,9 @@ fn draw_command(frame: &mut Frame, app: &App, area: Rect) {
     }
 }
 
-fn draw_help(frame: &mut Frame, area: Rect) {
-    // Flow into more columns when the terminal is too short for one.
-    let rows = (area.height.saturating_sub(2) as usize).max(1);
-    let columns = HELP.len().div_ceil(rows);
-    let rows = HELP.len().div_ceil(columns);
-    // Each column is as wide as its own contents, so a column of short entries does not
-    // take the room a long one needs.
-    let widths: Vec<(usize, usize)> = HELP
-        .chunks(rows)
-        .map(|column| {
-            let keys = column.iter().map(|h| match h {
-                Help::Key(k, _) => k.width(),
-                Help::Section(_) => 0,
-            });
-            let keys = keys.max().unwrap_or(0);
-            let cells = column.iter().map(|h| match h {
-                Help::Key(_, d) => keys + d.width() + 4,
-                Help::Section(s) => s.width() + 2,
-            });
-            (keys, cells.max().unwrap_or(0))
-        })
-        .collect();
-    let heading = Style::new().fg(ACCENT).add_modifier(Modifier::BOLD);
-    let lines: Vec<Line> = (0..rows)
-        .map(|r| {
-            let cells = widths
-                .iter()
-                .enumerate()
-                .filter_map(|(c, &(keys, cell))| Some((HELP.get(c * rows + r)?, keys, cell)));
-            let spans = cells.flat_map(|(h, keys, cell)| match h {
-                Help::Section(title) => {
-                    vec![Span::styled(
-                        format!(" {title:<w$} ", w = cell - 2),
-                        heading,
-                    )]
-                }
-                Help::Key(k, d) => vec![
-                    Span::styled(format!(" {k:<keys$}  "), Style::new().fg(Color::Yellow)),
-                    Span::raw(format!("{d:<w$} ", w = cell - keys - 4)),
-                ],
-            });
-            Line::from(spans.collect::<Vec<_>>())
-        })
-        .collect();
-    let width = widths.iter().map(|(_, cell)| cell).sum::<usize>() as u16 + 2;
-    let popup = centered(area, width, rows as u16 + 2);
-    frame.render_widget(Clear, popup);
-    frame.render_widget(Paragraph::new(lines).block(popup_block(" keys ")), popup);
-}
-
-/// The frame every overlay shares.
-fn popup_block(title: &str) -> Block<'static> {
-    Block::bordered()
-        .border_type(BorderType::Rounded)
-        .border_style(DIM)
-        .title(Span::styled(
-            title.to_string(),
-            Style::new().fg(ACCENT).add_modifier(Modifier::BOLD),
-        ))
-}
-
-fn draw_find(frame: &mut Frame, finder: &Finder, area: Rect, icons: bool) {
-    let width = (area.width * 9 / 10).max(20);
-    let height = (area.height * 8 / 10).max(5);
-    let popup = centered(area, width, height);
-    frame.render_widget(Clear, popup);
-    let block = popup_block(" find ");
-    let inner = block.inner(popup);
-    frame.render_widget(block, popup);
-    if inner.height < 2 {
-        return;
-    }
-
-    let count = match &finder.index {
-        _ if finder.indexing() => "indexing…".to_string(),
-        Some(index) => {
-            // Only the best FIND_LIMIT are kept, so a full list means there were more.
-            let capped = if finder.matches.len() >= FIND_LIMIT {
-                "+"
-            } else {
-                ""
-            };
-            let cut = if index.truncated { "+" } else { "" };
-            format!(
-                "{}{capped}/{}{cut}",
-                finder.matches.len(),
-                index.paths.len()
-            )
-        }
-        None => String::new(),
-    };
-    let [prompt_area, count_area] = Layout::horizontal([
-        Constraint::Min(0),
-        Constraint::Length(count.width() as u16 + 1),
-    ])
-    .areas(Rect { height: 1, ..inner });
-    let prompt = Line::from(vec![
-        Span::styled(" › ", Style::new().fg(Color::Cyan)),
-        Span::raw(finder.query.clone()),
-    ]);
-    frame.render_widget(Paragraph::new(prompt), prompt_area);
-    frame.render_widget(Paragraph::new(Span::styled(count, DIM)), count_area);
-    let cursor = prompt_area.x + 3 + finder.query.width() as u16;
-    frame.set_cursor_position((cursor.min(prompt_area.right().saturating_sub(1)), inner.y));
-
-    let Some(index) = &finder.index else {
-        return;
-    };
-    let rows = Rect {
-        y: inner.y + 1,
-        height: inner.height - 1,
-        ..inner
-    };
-    let height = rows.height as usize;
-    // Keep the selection in view; the list is short enough to recompute every frame.
-    let offset = finder.selected.saturating_sub(height.saturating_sub(1));
-    let lines: Vec<Line> = finder
-        .matches
-        .iter()
-        .enumerate()
-        .skip(offset)
-        .take(height)
-        .map(|(i, m)| {
-            let line = find_line(&index.paths[m.idx], &m.hits, rows.width as usize, icons);
-            if i == finder.selected {
-                line.patch_style(SELECTED)
-            } else {
-                line
-            }
-        })
-        .collect();
-    frame.render_widget(Paragraph::new(lines), rows);
-}
-
-/// A found path: its directory dimmed, the name bright, matches highlighted, and cut from the
-/// left when too long, since the end of a path is the part that tells files apart.
-fn find_line(path: &str, hits: &[usize], width: usize, icons: bool) -> Line<'static> {
-    let chars: Vec<char> = path.chars().collect();
-    let is_dir = path.ends_with('/');
-    let name_start = chars[..chars.len().saturating_sub(1)]
-        .iter()
-        .rposition(|&c| c == '/')
-        .map_or(0, |i| i + 1);
-    // One column goes to the leading space, two more to an icon and its gap.
-    let room = width.saturating_sub(if icons { 3 } else { 1 });
-    let mut start = 0;
-    let mut used: usize = chars.iter().map(|c| c.width().unwrap_or(0)).sum();
-    if used > room {
-        // Leave a column for the ellipsis.
-        while start < chars.len() && used > room.saturating_sub(1) {
-            used -= chars[start].width().unwrap_or(0);
-            start += 1;
-        }
-    }
-
-    let hit = Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD);
-    let name = if is_dir {
-        Style::new().fg(Color::Blue).add_modifier(Modifier::BOLD)
-    } else {
-        Style::new()
-    };
-    let mut spans = vec![Span::raw(" ")];
-    if icons {
-        let name = path
-            .trim_end_matches('/')
-            .rsplit('/')
-            .next()
-            .unwrap_or(path);
-        let kind = if is_dir {
-            icons::Kind::Dir
-        } else {
-            icons::Kind::File
-        };
-        let icon = icons::for_name(name, kind);
-        spans.push(Span::styled(
-            format!("{} ", icon.glyph),
-            Style::new().fg(icon.color),
-        ));
-    }
-    if start > 0 {
-        spans.push(Span::styled("…", DIM));
-    }
-    let mut hits = hits.iter().peekable();
-    while hits.next_if(|&&h| h < start).is_some() {}
-    let (mut run, mut run_style) = (String::new(), None);
-    for (i, &c) in chars.iter().enumerate().skip(start) {
-        let style = if hits.next_if(|&&h| h == i).is_some() {
-            hit
-        } else if i < name_start {
-            DIM
-        } else {
-            name
-        };
-        if run_style.is_some_and(|s| s != style) {
-            spans.push(Span::styled(
-                std::mem::take(&mut run),
-                run_style.unwrap_or_default(),
-            ));
-        }
-        run_style = Some(style);
-        run.push(if c.is_control() { '?' } else { c });
-    }
-    if !run.is_empty() {
-        spans.push(Span::styled(run, run_style.unwrap_or_default()));
-    }
-    Line::from(spans)
-}
-
-fn centered(area: Rect, width: u16, height: u16) -> Rect {
-    let (width, height) = (width.min(area.width), height.min(area.height));
-    Rect {
-        x: area.x + (area.width - width) / 2,
-        y: area.y + (area.height - height) / 2,
-        width,
-        height,
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use super::overlays::{HELP, Help};
     use super::*;
     use crate::dir::testutil::TempDir;
     use ratatui::Terminal;
@@ -909,39 +536,6 @@ mod tests {
             .collect();
         insta::assert_snapshot!(snapshot.join("\n"));
         assert_eq!(app.page, 5);
-    }
-
-    #[test]
-    fn long_names_truncate_with_an_ellipsis() {
-        let tmp = TempDir::new();
-        tmp.file("a-very-long-file-name-that-will-not-fit.txt", "");
-        let e = Entry::from_path(
-            tmp.path()
-                .join("a-very-long-file-name-that-will-not-fit.txt"),
-        )
-        .unwrap();
-        let line = entry_line(&e, &[], None, false, 20, true, false);
-        assert_eq!(line.width(), 20);
-        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(text.contains('…'), "{text}");
-        assert!(text.ends_with("0 B"), "{text}");
-    }
-
-    #[test]
-    fn find_lines_cut_from_the_left() {
-        let text = |line: Line| {
-            line.spans
-                .iter()
-                .map(|s| s.content.to_string())
-                .collect::<String>()
-        };
-        assert_eq!(
-            text(find_line("src/app.rs", &[4], 40, false)),
-            " src/app.rs"
-        );
-        let long = find_line("a/very/deeply/nested/path/to/main.rs", &[], 16, false);
-        assert_eq!(text(long.clone()), " …ath/to/main.rs");
-        assert_eq!(long.width(), 16);
     }
 
     #[test]

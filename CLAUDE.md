@@ -66,8 +66,8 @@ especially *Look at this sceptically*: name the weakest part of the change.
 
 - `src/app.rs` owns state and key handling. Work that needs the terminal (an
   editor, a shell, quitting) is returned as an `Effect` and carried out by
-  `src/main.rs`. Do not touch the terminal from `app.rs` or `ui.rs`.
-- `src/ui.rs` draws from `App` and writes back only the viewport (`offset`,
+  `src/main.rs`. Do not touch the terminal from `app.rs` or `src/ui/`.
+- `src/ui/` draws from `App` and writes back only the viewport (`offset`,
   `page`). No filesystem writes, no processes while drawing.
 - Previews are built on the worker thread in `src/preview.rs`. Anything slow
   that depends on the selection belongs there, never in the event loop. Only
