@@ -137,7 +137,7 @@ fn run(terminal: &mut DefaultTerminal, app: &mut App) -> io::Result<bool> {
         } else {
             dirty |= app.tick();
         }
-        dirty |= app.poll_preview() | app.poll_git();
+        dirty |= app.poll_preview() | app.poll_git() | app.poll_job();
     }
 }
 

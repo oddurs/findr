@@ -368,6 +368,9 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
     if !app.marked.is_empty() {
         right.push(format!("{} marked", app.marked.len()));
     }
+    if let Some(job) = &app.job {
+        right.push(format!("pasting {}/{}", job.done, job.total));
+    }
     if let Some(clip) = &app.clip {
         right.push(format!(
             "{} {}",
@@ -418,15 +421,20 @@ fn draw_command(frame: &mut Frame, app: &App, area: Rect) {
                 &input.text[..input.byte(input.cursor)],
             );
         }
-        Mode::Confirm(Confirm::Trash(paths)) => {
-            let what = match paths.as_slice() {
-                [one] => one.file_name().map_or_else(
-                    || one.display().to_string(),
-                    |n| n.to_string_lossy().into_owned(),
-                ),
-                many => format!("{} items", many.len()),
+        Mode::Confirm(confirm) => {
+            let text = match confirm {
+                Confirm::Trash(paths) => {
+                    let what = match paths.as_slice() {
+                        [one] => one.file_name().map_or_else(
+                            || one.display().to_string(),
+                            |n| n.to_string_lossy().into_owned(),
+                        ),
+                        many => format!("{} items", many.len()),
+                    };
+                    format!(" move {what} to trash? [y/N]")
+                }
+                Confirm::Quit { .. } => " a paste is still running — quit anyway? [y/N]".into(),
             };
-            let text = format!(" move {what} to trash? [y/N]");
             frame.render_widget(
                 Paragraph::new(Span::styled(
                     text,

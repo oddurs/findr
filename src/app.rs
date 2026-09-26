@@ -5,7 +5,8 @@ use std::env;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
-use std::sync::mpsc::{Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -35,6 +36,23 @@ pub enum Mode {
 
 pub enum Confirm {
     Trash(Vec<PathBuf>),
+    /// Quitting mid-paste would leave a half-copied tree behind.
+    Quit {
+        write_cwd: bool,
+    },
+}
+
+/// A paste running on a worker thread.
+pub struct Job {
+    pub dest: PathBuf,
+    pub total: usize,
+    pub done: usize,
+    rx: Receiver<JobEvent>,
+}
+
+enum JobEvent {
+    Progress(usize),
+    Finished(ops::Pasted),
 }
 
 pub enum InputKind {
@@ -152,6 +170,7 @@ pub struct App {
     pub mode: Mode,
     pub marked: BTreeSet<PathBuf>,
     pub clip: Option<Clip>,
+    pub job: Option<Job>,
     pub git: Option<Repo>,
     pub message: Option<Message>,
     pub preview: Option<(PathBuf, Preview)>,
@@ -199,6 +218,7 @@ impl App {
             mode: Mode::Normal,
             marked: BTreeSet::new(),
             clip: None,
+            job: None,
             git: None,
             message: None,
             preview: None,
@@ -410,7 +430,7 @@ impl App {
     pub fn pending(&self) -> bool {
         let preview = self.requested.is_some()
             && self.preview.as_ref().map(|(p, _)| p) != self.requested.as_ref();
-        preview || (self.git_pending && self.git_wanted.is_some())
+        preview || (self.git_pending && self.git_wanted.is_some()) || self.job.is_some()
     }
 
     /// Takes finished previews. Returns whether one worth showing arrived.
@@ -477,7 +497,7 @@ impl App {
             Mode::Normal => return self.normal_key(key),
             Mode::Filter => self.filter_key(key),
             Mode::Input(input) => self.input_key(input, key),
-            Mode::Confirm(confirm) => self.confirm_key(confirm, key),
+            Mode::Confirm(confirm) => return self.confirm_key(confirm, key),
             Mode::Goto => self.goto_key(key),
             Mode::Help => {}
         }
@@ -558,8 +578,8 @@ impl App {
             KeyCode::Char('J') => self.scroll_preview(PREVIEW_STEP as isize),
             KeyCode::Char('K') => self.scroll_preview(-(PREVIEW_STEP as isize)),
             KeyCode::Char('?') => self.mode = Mode::Help,
-            KeyCode::Char('q') => return Some(Effect::Quit { write_cwd: true }),
-            KeyCode::Char('Q') => return Some(Effect::Quit { write_cwd: false }),
+            KeyCode::Char('q') => return self.quit(true),
+            KeyCode::Char('Q') => return self.quit(false),
             KeyCode::Esc if !self.filter.is_empty() => self.clear_filter(),
             KeyCode::Esc => self.marked.clear(),
             _ => {}
@@ -657,13 +677,24 @@ impl App {
         }
     }
 
-    fn confirm_key(&mut self, confirm: Confirm, key: KeyEvent) {
+    fn confirm_key(&mut self, confirm: Confirm, key: KeyEvent) -> Option<Effect> {
         if !matches!(key.code, KeyCode::Char('y' | 'Y')) {
-            return self.info("cancelled");
+            self.info("cancelled");
+            return None;
         }
         match confirm {
             Confirm::Trash(paths) => self.trash(paths),
+            Confirm::Quit { write_cwd } => return Some(Effect::Quit { write_cwd }),
         }
+        None
+    }
+
+    fn quit(&mut self, write_cwd: bool) -> Option<Effect> {
+        if self.job.is_some() {
+            self.mode = Mode::Confirm(Confirm::Quit { write_cwd });
+            return None;
+        }
+        Some(Effect::Quit { write_cwd })
     }
 
     fn goto_key(&mut self, key: KeyEvent) {
@@ -836,52 +867,77 @@ impl App {
         self.marked.clear();
     }
 
+    /// Starts copying or moving the clipboard here on a worker; `poll_job` sees it finish.
     fn paste(&mut self) {
+        if self.job.is_some() {
+            return self.info("a paste is already running");
+        }
         let Some(clip) = self.clip.take() else {
             return self.info("nothing to paste");
         };
-        let mut done = 0;
-        let mut last = None;
-        let mut failure = None;
-        for src in &clip.paths {
-            if clip.cut && src.parent() == Some(self.cwd.as_path()) {
-                continue;
-            }
-            if src.is_dir() && self.cwd.starts_with(src) {
-                failure = Some(format!("cannot paste {} into itself", src.display()));
-                break;
-            }
-            let result = src
-                .file_name()
-                .map(|n| ops::unique_dest(&self.cwd, &n.to_string_lossy()))
-                .ok_or_else(|| io::Error::other("no file name"))
-                .and_then(|dst| {
-                    if clip.cut {
-                        ops::move_path(src, &dst)
-                    } else {
-                        ops::copy_all(src, &dst)
-                    }
-                    .map(|()| dst)
-                });
-            match result {
-                Ok(dst) => {
-                    done += 1;
-                    last = dst.file_name().map(|n| n.to_string_lossy().into_owned());
-                }
-                Err(e) => {
-                    failure = Some(format!("{}: {e}", src.display()));
-                    break;
-                }
-            }
-        }
-        let total = clip.paths.len();
-        // A copy can be pasted again; a cut has moved its files and is spent.
+        let (tx, rx) = mpsc::channel();
+        let (paths, dest, cut) = (clip.paths.clone(), self.cwd.clone(), clip.cut);
+        thread::spawn(move || {
+            let pasted = ops::paste(&paths, &dest, cut, |n| {
+                // Sends fail only once findr has quit, and then nobody is left to tell.
+                let _ = tx.send(JobEvent::Progress(n));
+            });
+            let _ = tx.send(JobEvent::Finished(pasted));
+        });
+        self.job = Some(Job {
+            dest: self.cwd.clone(),
+            total: clip.paths.len(),
+            done: 0,
+            rx,
+        });
+        // A copy can be pasted again; a cut is spent once its files have moved.
         if !clip.cut {
             self.clip = Some(clip);
         }
-        self.reload_selecting(last.or_else(|| self.selected().map(|e| e.name.clone())));
+    }
+
+    /// Takes progress from a running paste. Returns whether anything visible changed.
+    pub fn poll_job(&mut self) -> bool {
+        let Some(job) = self.job.as_mut() else {
+            return false;
+        };
+        let mut changed = false;
+        let mut finished = None;
+        let mut vanished = false;
+        loop {
+            match job.rx.try_recv() {
+                Ok(JobEvent::Progress(n)) => job.done = n,
+                Ok(JobEvent::Finished(pasted)) => finished = Some(pasted),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    vanished = finished.is_none();
+                    break;
+                }
+            }
+            changed = true;
+        }
+        let (dest, total) = (job.dest.clone(), job.total);
+        if let Some(pasted) = finished {
+            self.job = None;
+            self.finish_paste(&dest, total, pasted);
+            return true;
+        }
+        if vanished {
+            self.job = None;
+            self.reload();
+            self.error("the paste stopped unexpectedly; check what arrived");
+            return true;
+        }
+        changed
+    }
+
+    fn finish_paste(&mut self, dest: &Path, total: usize, pasted: ops::Pasted) {
+        // The cursor follows the pasted item only if we are still looking at where it went.
+        let select = pasted.last.filter(|_| dest == self.cwd);
+        self.reload_selecting(select.or_else(|| self.selected().map(|e| e.name.clone())));
         self.sync_git(true);
-        match failure {
+        let done = pasted.done;
+        match pasted.failure {
             Some(f) => self.error(format!("pasted {done} of {total}: {f}")),
             None => self.info(format!("pasted {}", count(done))),
         }
@@ -1050,20 +1106,62 @@ mod tests {
     fn copy_paste_and_cut_paste() {
         let (tmp, mut app) = setup();
         press(&mut app, "Gyp");
+        assert!(app.job.is_some(), "a paste runs off the event loop");
+        wait(&mut app, |a| a.job.is_none());
         assert!(tmp.path().join("README copy.md").exists());
+        assert_eq!(app.selected().unwrap().name, "README copy.md");
         press(&mut app, "k");
         assert_eq!(app.selected().unwrap().name, "Cargo.toml");
         press(&mut app, "xggl");
         press(&mut app, "p");
+        assert!(app.clip.is_none(), "a cut is spent once pasted");
+        wait(&mut app, |a| a.job.is_none());
         assert!(tmp.path().join("src/Cargo.toml").exists());
         assert!(!tmp.path().join("Cargo.toml").exists());
         assert!(app.clip.is_none());
     }
 
     #[test]
+    fn quitting_mid_paste_asks_first() {
+        let (_tmp, mut app) = setup();
+        let (_tx, rx) = mpsc::channel();
+        app.job = Some(Job {
+            dest: app.cwd.clone(),
+            total: 1,
+            done: 0,
+            rx,
+        });
+        assert!(app.handle_key(key(KeyCode::Char('q'))).is_none());
+        assert!(matches!(
+            app.mode,
+            Mode::Confirm(Confirm::Quit { write_cwd: true })
+        ));
+        press(&mut app, "n");
+        assert!(matches!(app.mode, Mode::Normal));
+        assert!(app.handle_key(key(KeyCode::Char('q'))).is_none());
+        let quit = app.handle_key(key(KeyCode::Char('y')));
+        assert!(matches!(quit, Some(Effect::Quit { write_cwd: true })));
+    }
+
+    #[test]
+    fn a_second_paste_waits_for_the_first() {
+        let (_tmp, mut app) = setup();
+        let (_tx, rx) = mpsc::channel();
+        app.job = Some(Job {
+            dest: app.cwd.clone(),
+            total: 1,
+            done: 0,
+            rx,
+        });
+        press(&mut app, "Gyp");
+        assert_eq!(app.message().unwrap().text, "a paste is already running");
+    }
+
+    #[test]
     fn pasting_a_directory_into_itself_is_refused() {
         let (tmp, mut app) = setup();
         press(&mut app, "ylp");
+        wait(&mut app, |a| a.job.is_none());
         assert!(app.message().unwrap().error);
         assert!(!tmp.path().join("src/src").exists());
     }
@@ -1098,6 +1196,7 @@ mod tests {
             assert!(Instant::now() < deadline, "a worker never answered");
             app.poll_preview();
             app.poll_git();
+            app.poll_job();
             std::thread::sleep(Duration::from_millis(5));
         }
     }
