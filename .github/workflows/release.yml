@@ -1,0 +1,46 @@
+name: release
+
+# Pushing a v* tag runs the checks and publishes a GitHub release with notes
+# generated from the merged pull requests.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - run: ./scripts/task check
+
+  publish:
+    needs: [check]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          tag="${GITHUB_REF_NAME}"
+          gh release create "$tag" --title "$tag" --generate-notes --verify-tag
+
+          # Generated notes credit whoever appears in the history, and a bot or
+          # an assistant that ended up there must not be credited in a release.
+          notes=$(gh release view "$tag" --json body --jq .body)
+          # GNU sed on the runner: the I flag makes the address case-insensitive.
+          cleaned=$(printf '%s\n' "$notes" | sed -E \
+            '/(claude|anthropic|copilot|chatgpt|\[bot\]|generated (with|by) +(claude|chatgpt|copilot|an? (ai|assistant|llm)))/Id')
+          if [ "$notes" != "$cleaned" ]; then
+            printf '%s\n' "$cleaned" | gh release edit "$tag" --notes-file -
+          fi

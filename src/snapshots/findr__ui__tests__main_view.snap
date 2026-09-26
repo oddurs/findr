@@ -1,0 +1,11 @@
+---
+source: src/ui.rs
+expression: "snapshot.join(\"\\n\")"
+---
+│   src/                    │    lib.rs                      0 B
+│   a-rather-long-file-… 0 B│    main.rs                    13 B
+│   notes.txt            5 B│                                   
+│                           │                                   
+│                           │                                   
+ drwxr-xr-x  just now                                                name↓  1/3 
+ ? help

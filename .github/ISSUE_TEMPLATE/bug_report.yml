@@ -1,0 +1,46 @@
+name: Bug report
+description: Something findr does that it should not
+labels: [bug]
+body:
+  - type: textarea
+    id: what-happens
+    attributes:
+      label: What happens
+      description: What you did, and what findr did about it.
+      placeholder: |
+        Pressed `p` in a directory I had cut from, and the files were copied instead of left alone.
+    validations:
+      required: true
+
+  - type: textarea
+    id: what-should-happen
+    attributes:
+      label: What should happen
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: How to reproduce
+      description: The smallest directory layout and key sequence that shows it.
+      render: text
+    validations:
+      required: false
+
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Output of `findr --version`.
+      placeholder: findr 0.1.0
+    validations:
+      required: true
+
+  - type: input
+    id: platform
+    attributes:
+      label: Platform and terminal
+      placeholder: macOS 15.2, Ghostty 1.1
+    validations:
+      required: true

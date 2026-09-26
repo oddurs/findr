@@ -1,0 +1,20 @@
+#!/bin/sh
+# Run once after cloning. Wires up the git hooks and checks the toolchain.
+set -eu
+
+cd "$(dirname "$0")/.."
+
+printf 'setting up findr\n'
+
+git config core.hooksPath .githooks
+printf '  hooks: core.hooksPath = .githooks\n'
+
+if ! command -v cargo >/dev/null 2>&1; then
+  printf '\nno cargo on PATH. Install Rust from https://rustup.rs and run this again.\n' >&2
+  exit 1
+fi
+printf '  toolchain: %s\n' "$(rustc --version)"
+
+printf '\nready. Next:\n'
+printf '  scripts/task check              everything CI runs\n'
+printf '  scripts/agent start feat/thing  a worktree, a branch, and somewhere to work\n'

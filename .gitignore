@@ -1,0 +1,19 @@
+# Build output
+/target
+
+# insta writes pending snapshots beside the accepted ones; only accepted ones are committed.
+*.snap.new
+*.pending-snap
+
+# Worktrees created by scripts/agent live beside the repository, but a stray
+# one inside it must never be committed.
+.worktrees/
+
+# Editors
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# macOS
+.DS_Store

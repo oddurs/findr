@@ -1,0 +1,48 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A new push to a branch makes the run in flight pointless.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    # Both, deliberately: trash, the opener and the clipboard differ between
+    # macOS and Linux, and findr claims to run on both.
+    name: check (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v7
+      # rustup installs the toolchain named in rust-toolchain.toml on the first
+      # cargo invocation, so there is nothing to pin twice.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - run: ./scripts/task check
+
+  # The one status check branch protection requires. It exists so that adding a
+  # job never means editing a protection rule.
+  required:
+    name: required
+    if: always()
+    needs: [check]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Every job succeeded
+        run: |
+          if [ "${{ needs.check.result }}" != "success" ]; then
+            echo "check: ${{ needs.check.result }}"
+            exit 1
+          fi

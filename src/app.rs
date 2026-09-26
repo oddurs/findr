@@ -1,0 +1,1094 @@
+//! Application state and key handling. Drawing lives in `ui`, terminal I/O in `main`.
+
+use std::collections::{BTreeSet, HashMap};
+use std::env;
+use std::io;
+use std::path::{Path, PathBuf};
+use std::process::{Command, ExitStatus, Stdio};
+use std::sync::mpsc::{Receiver, Sender};
+use std::time::{Duration, Instant, SystemTime};
+
+use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+use crate::dir::{self, Entry, SortKey};
+use crate::fuzzy;
+use crate::git::{self, Repo};
+use crate::ops::{self, Trash};
+use crate::preview::{self, Preview};
+
+const MESSAGE_TTL: Duration = Duration::from_secs(4);
+const PREVIEW_STEP: usize = 3;
+
+pub struct ViewItem {
+    pub idx: usize,
+    pub hits: Vec<usize>,
+}
+
+pub enum Mode {
+    Normal,
+    Filter,
+    Input(Input),
+    Confirm(Confirm),
+    Help,
+    Goto,
+}
+
+pub enum Confirm {
+    Trash(Vec<PathBuf>),
+}
+
+pub enum InputKind {
+    Rename(PathBuf),
+    NewFile,
+    NewDir,
+    Jump,
+}
+
+impl InputKind {
+    pub fn prompt(&self) -> &'static str {
+        match self {
+            InputKind::Rename(_) => "rename: ",
+            InputKind::NewFile => "new file: ",
+            InputKind::NewDir => "new directory: ",
+            InputKind::Jump => "go to: ",
+        }
+    }
+}
+
+pub struct Input {
+    pub kind: InputKind,
+    pub text: String,
+    /// In chars, not bytes.
+    pub cursor: usize,
+}
+
+impl Input {
+    fn new(kind: InputKind, text: &str, cursor: usize) -> Input {
+        Input {
+            kind,
+            text: text.to_string(),
+            cursor,
+        }
+    }
+
+    pub fn byte(&self, cursor: usize) -> usize {
+        self.text
+            .char_indices()
+            .nth(cursor)
+            .map_or(self.text.len(), |(i, _)| i)
+    }
+
+    fn edit(&mut self, key: KeyEvent) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let len = self.text.chars().count();
+        match key.code {
+            KeyCode::Char('a') if ctrl => self.cursor = 0,
+            KeyCode::Char('e') if ctrl => self.cursor = len,
+            KeyCode::Char('u') if ctrl => {
+                self.text.drain(..self.byte(self.cursor));
+                self.cursor = 0;
+            }
+            KeyCode::Char('w') if ctrl => {
+                let end = self.byte(self.cursor);
+                let start = word_start(&self.text[..end]);
+                self.cursor = self.text[..start].chars().count();
+                self.text.drain(start..end);
+            }
+            KeyCode::Home => self.cursor = 0,
+            KeyCode::End => self.cursor = len,
+            KeyCode::Left => self.cursor = self.cursor.saturating_sub(1),
+            KeyCode::Right => self.cursor = (self.cursor + 1).min(len),
+            KeyCode::Backspace if self.cursor > 0 => {
+                self.cursor -= 1;
+                self.text.remove(self.byte(self.cursor));
+            }
+            KeyCode::Delete if self.cursor < len => {
+                self.text.remove(self.byte(self.cursor));
+            }
+            KeyCode::Char(c) if !ctrl => {
+                self.text.insert(self.byte(self.cursor), c);
+                self.cursor += 1;
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Byte index where the last word of `s` starts, for ctrl-w.
+fn word_start(s: &str) -> usize {
+    let sep = |c: char| matches!(c, ' ' | '/' | '.' | '-' | '_');
+    s.trim_end_matches(sep).rfind(sep).map_or(0, |i| i + 1)
+}
+
+pub struct Clip {
+    pub paths: Vec<PathBuf>,
+    pub cut: bool,
+}
+
+pub struct Message {
+    pub text: String,
+    pub error: bool,
+    at: Instant,
+}
+
+/// Work that needs the terminal, which `main` owns.
+pub enum Effect {
+    Quit { write_cwd: bool },
+    Run(Command),
+}
+
+pub struct App {
+    pub cwd: PathBuf,
+    pub entries: Vec<Entry>,
+    pub view: Vec<ViewItem>,
+    pub selected: usize,
+    pub offset: usize,
+    pub parent: Vec<Entry>,
+    pub parent_selected: Option<usize>,
+    pub show_hidden: bool,
+    pub sort: SortKey,
+    pub reverse: bool,
+    pub filter: String,
+    pub mode: Mode,
+    pub marked: BTreeSet<PathBuf>,
+    pub clip: Option<Clip>,
+    pub git: Option<Repo>,
+    pub message: Option<Message>,
+    pub preview: Option<(PathBuf, Preview)>,
+    pub preview_scroll: usize,
+    /// Rows in the file list, recorded by the last draw; drives page movement.
+    pub page: usize,
+    back: Vec<PathBuf>,
+    cursors: HashMap<PathBuf, String>,
+    cwd_mtime: Option<SystemTime>,
+    trash: Option<Trash>,
+    requested: Option<PathBuf>,
+    preview_tx: Sender<preview::Request>,
+    preview_rx: Receiver<preview::Response>,
+}
+
+impl App {
+    /// Opens `start`; a file opens its directory with the cursor on it.
+    pub fn new(start: &Path, trash: Option<Trash>) -> io::Result<App> {
+        let start = std::fs::canonicalize(start)?;
+        let (dir, select) = match start.parent() {
+            Some(parent) if !start.is_dir() => (
+                parent.to_path_buf(),
+                start.file_name().map(|n| n.to_string_lossy().into_owned()),
+            ),
+            _ => (start, None),
+        };
+        let (preview_tx, preview_rx) = preview::spawn();
+        let mut app = App {
+            cwd: dir.clone(),
+            entries: Vec::new(),
+            view: Vec::new(),
+            selected: 0,
+            offset: 0,
+            parent: Vec::new(),
+            parent_selected: None,
+            show_hidden: false,
+            sort: SortKey::Name,
+            reverse: false,
+            filter: String::new(),
+            mode: Mode::Normal,
+            marked: BTreeSet::new(),
+            clip: None,
+            git: None,
+            message: None,
+            preview: None,
+            preview_scroll: 0,
+            page: 20,
+            back: Vec::new(),
+            cursors: HashMap::new(),
+            cwd_mtime: None,
+            trash,
+            requested: None,
+            preview_tx,
+            preview_rx,
+        };
+        app.load(dir, select)?;
+        Ok(app)
+    }
+
+    pub fn selected(&self) -> Option<&Entry> {
+        self.view.get(self.selected).map(|v| &self.entries[v.idx])
+    }
+
+    pub fn message(&self) -> Option<&Message> {
+        self.message
+            .as_ref()
+            .filter(|m| m.at.elapsed() < MESSAGE_TTL)
+    }
+
+    fn info(&mut self, text: impl Into<String>) {
+        self.message = Some(Message {
+            text: text.into(),
+            error: false,
+            at: Instant::now(),
+        });
+    }
+
+    fn error(&mut self, text: impl Into<String>) {
+        self.message = Some(Message {
+            text: text.into(),
+            error: true,
+            at: Instant::now(),
+        });
+    }
+
+    /// Lists `dir` and makes it current, with the cursor on `select` or wherever it last was there.
+    fn load(&mut self, dir: PathBuf, select: Option<String>) -> io::Result<()> {
+        let mut entries = dir::list(&dir, self.show_hidden)?;
+        dir::sort(&mut entries, self.sort, self.reverse);
+        if let Some(name) = self.selected().map(|e| e.name.clone()) {
+            self.cursors.insert(self.cwd.clone(), name);
+        }
+        if dir != self.cwd {
+            self.filter.clear();
+            self.offset = 0;
+        }
+        self.cwd_mtime = dir::mtime(&dir);
+        self.cwd = dir;
+        self.entries = entries;
+        self.load_parent();
+        self.sync_git(false);
+        let select = select.or_else(|| self.cursors.get(&self.cwd).cloned());
+        self.rebuild_view(select.as_deref());
+        Ok(())
+    }
+
+    fn load_parent(&mut self) {
+        self.parent.clear();
+        self.parent_selected = None;
+        let Some(parent) = self.cwd.parent() else {
+            return;
+        };
+        // An unreadable parent shows as an empty column; the current directory still works.
+        let Ok(mut entries) = dir::list(parent, true) else {
+            return;
+        };
+        entries.retain(|e| self.show_hidden || !e.is_hidden() || e.path == self.cwd);
+        dir::sort(&mut entries, self.sort, self.reverse);
+        self.parent_selected = entries.iter().position(|e| e.path == self.cwd);
+        self.parent = entries;
+    }
+
+    /// Reloads git status when the repository changed, or always with `force`.
+    fn sync_git(&mut self, force: bool) {
+        let root = git::find_root(&self.cwd);
+        if !force && self.git.as_ref().map(|r| &r.root) == root.as_ref() {
+            return;
+        }
+        self.git = None;
+        let Some(root) = root else {
+            return;
+        };
+        match Repo::load(&root) {
+            Ok(repo) => self.git = Some(repo),
+            // No git installed: browse without status.
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => self.error(format!("git: {e}")),
+        }
+    }
+
+    /// Recomputes the visible entries from the filter and puts the cursor on `select`, else the top.
+    fn rebuild_view(&mut self, select: Option<&str>) {
+        self.view = if self.filter.is_empty() {
+            (0..self.entries.len())
+                .map(|idx| ViewItem {
+                    idx,
+                    hits: Vec::new(),
+                })
+                .collect()
+        } else {
+            let mut scored: Vec<(i64, ViewItem)> = self
+                .entries
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, e)| {
+                    fuzzy::score(&self.filter, &e.name).map(|(s, hits)| (s, ViewItem { idx, hits }))
+                })
+                .collect();
+            scored.sort_by_key(|(s, _)| std::cmp::Reverse(*s));
+            scored.into_iter().map(|(_, v)| v).collect()
+        };
+        self.selected = select
+            .and_then(|name| {
+                self.view
+                    .iter()
+                    .position(|v| self.entries[v.idx].name == name)
+            })
+            .unwrap_or(0);
+        self.clamp();
+    }
+
+    fn clamp(&mut self) {
+        self.selected = self.selected.min(self.view.len().saturating_sub(1));
+    }
+
+    /// Re-reads the current directory, keeping the cursor on the same name where it still exists.
+    pub fn reload(&mut self) {
+        let keep = self.selected().map(|e| e.name.clone());
+        self.reload_selecting(keep);
+    }
+
+    fn reload_selecting(&mut self, select: Option<String>) {
+        // Contents may have changed under the same path, so ask for a fresh preview.
+        self.requested = None;
+        let cwd = self.cwd.clone();
+        let mut failure = None;
+        // If the directory was removed from under us, fall back to the nearest one that exists.
+        for (i, dir) in cwd.ancestors().enumerate() {
+            let select = if i == 0 { select.clone() } else { None };
+            match self.load(dir.to_path_buf(), select) {
+                Ok(()) => break,
+                Err(e) => {
+                    failure.get_or_insert(e);
+                }
+            }
+        }
+        if let Some(e) = failure {
+            self.error(format!("{}: {e}", cwd.display()));
+        }
+    }
+
+    /// Asks the worker for the selected entry's preview if it is not already the one requested.
+    pub fn sync_preview(&mut self) {
+        let want = self.selected().map(|e| e.path.clone());
+        if want == self.requested {
+            return;
+        }
+        self.requested = want.clone();
+        self.preview_scroll = 0;
+        if let Some(path) = want {
+            let req = preview::Request {
+                path,
+                show_hidden: self.show_hidden,
+            };
+            if self.preview_tx.send(req).is_err() {
+                self.error("preview worker stopped");
+            }
+        }
+    }
+
+    pub fn preview_pending(&self) -> bool {
+        self.requested.is_some() && self.preview.as_ref().map(|(p, _)| p) != self.requested.as_ref()
+    }
+
+    /// Takes finished previews. Returns whether one worth showing arrived.
+    pub fn poll_preview(&mut self) -> bool {
+        let mut fresh = false;
+        while let Ok(resp) = self.preview_rx.try_recv() {
+            if Some(&resp.path) == self.requested.as_ref() {
+                self.preview = Some((resp.path, resp.preview));
+                fresh = true;
+            }
+        }
+        fresh
+    }
+
+    /// Periodic work while idle. Returns whether anything visible changed.
+    pub fn tick(&mut self) -> bool {
+        let mut changed = false;
+        if self
+            .message
+            .as_ref()
+            .is_some_and(|m| m.at.elapsed() >= MESSAGE_TTL)
+        {
+            self.message = None;
+            changed = true;
+        }
+        if dir::mtime(&self.cwd) != self.cwd_mtime {
+            self.reload();
+            self.sync_git(true);
+            changed = true;
+        }
+        changed
+    }
+
+    /// After an editor or shell returns: whatever ran may have changed files, contents, or the index.
+    pub fn after_run(&mut self, status: io::Result<ExitStatus>) {
+        self.reload();
+        self.sync_git(true);
+        if let Err(e) = status {
+            self.error(format!("could not start: {e}"));
+        }
+    }
+
+    /// Marked paths if any, otherwise the one under the cursor.
+    fn targets(&self) -> Vec<PathBuf> {
+        if self.marked.is_empty() {
+            self.selected()
+                .map(|e| e.path.clone())
+                .into_iter()
+                .collect()
+        } else {
+            self.marked.iter().cloned().collect()
+        }
+    }
+
+    pub fn handle_key(&mut self, key: KeyEvent) -> Option<Effect> {
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+            return Some(Effect::Quit { write_cwd: false });
+        }
+        // Nothing is bound to Alt, and treating Alt-x as x would act on a key the user did not mean.
+        if key.modifiers.contains(KeyModifiers::ALT) {
+            return None;
+        }
+        match std::mem::replace(&mut self.mode, Mode::Normal) {
+            Mode::Normal => return self.normal_key(key),
+            Mode::Filter => self.filter_key(key),
+            Mode::Input(input) => self.input_key(input, key),
+            Mode::Confirm(confirm) => self.confirm_key(confirm, key),
+            Mode::Goto => self.goto_key(key),
+            Mode::Help => {}
+        }
+        None
+    }
+
+    fn normal_key(&mut self, key: KeyEvent) -> Option<Effect> {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let half = (self.page / 2).max(1) as isize;
+        match key.code {
+            KeyCode::Char('d') if ctrl => self.move_by(half),
+            KeyCode::Char('u') if ctrl => self.move_by(-half),
+            KeyCode::Char('j') | KeyCode::Down => self.move_by(1),
+            KeyCode::Char('k') | KeyCode::Up => self.move_by(-1),
+            KeyCode::PageDown => self.move_by(self.page as isize),
+            KeyCode::PageUp => self.move_by(-(self.page as isize)),
+            KeyCode::Home => self.move_to(0),
+            KeyCode::End | KeyCode::Char('G') => self.move_to(usize::MAX),
+            KeyCode::Char('g') => self.mode = Mode::Goto,
+            KeyCode::Char('h') | KeyCode::Left | KeyCode::Backspace => self.up(),
+            KeyCode::Char('l') | KeyCode::Right | KeyCode::Enter => return self.open(),
+            KeyCode::Char('e') => return self.edit(),
+            KeyCode::Char('o') => self.open_external(),
+            KeyCode::Char('!') => return Some(self.shell()),
+            KeyCode::Char('-') => self.go_back(),
+            KeyCode::Char('/') => self.mode = Mode::Filter,
+            KeyCode::Char(':') => self.mode = Mode::Input(Input::new(InputKind::Jump, "", 0)),
+            KeyCode::Char('.') => {
+                self.show_hidden = !self.show_hidden;
+                self.reload();
+                self.info(if self.show_hidden {
+                    "showing hidden files"
+                } else {
+                    "hiding hidden files"
+                });
+            }
+            KeyCode::Char('s') => {
+                self.sort = self.sort.next();
+                self.resort();
+            }
+            KeyCode::Char('S') => {
+                self.reverse = !self.reverse;
+                self.resort();
+            }
+            KeyCode::Char(' ') => self.toggle_mark(),
+            KeyCode::Char('y') => self.yank(false),
+            KeyCode::Char('x') => self.yank(true),
+            KeyCode::Char('p') => self.paste(),
+            KeyCode::Char('d') => {
+                let targets = self.targets();
+                if !targets.is_empty() {
+                    self.mode = Mode::Confirm(Confirm::Trash(targets));
+                }
+            }
+            KeyCode::Char('r') => {
+                if let Some(e) = self.selected() {
+                    let stem = dir::split_ext(&e.name).0.chars().count();
+                    let cursor = if e.is_dir {
+                        e.name.chars().count()
+                    } else {
+                        stem
+                    };
+                    self.mode = Mode::Input(Input::new(
+                        InputKind::Rename(e.path.clone()),
+                        &e.name,
+                        cursor,
+                    ));
+                }
+            }
+            KeyCode::Char('a') => self.mode = Mode::Input(Input::new(InputKind::NewFile, "", 0)),
+            KeyCode::Char('A') => self.mode = Mode::Input(Input::new(InputKind::NewDir, "", 0)),
+            KeyCode::Char('c') => self.copy_paths(),
+            KeyCode::Char('R') => {
+                self.reload();
+                self.sync_git(true);
+                self.info("reloaded");
+            }
+            KeyCode::Char('J') => self.scroll_preview(PREVIEW_STEP as isize),
+            KeyCode::Char('K') => self.scroll_preview(-(PREVIEW_STEP as isize)),
+            KeyCode::Char('?') => self.mode = Mode::Help,
+            KeyCode::Char('q') => return Some(Effect::Quit { write_cwd: true }),
+            KeyCode::Char('Q') => return Some(Effect::Quit { write_cwd: false }),
+            KeyCode::Esc if !self.filter.is_empty() => self.clear_filter(),
+            KeyCode::Esc => self.marked.clear(),
+            _ => {}
+        }
+        None
+    }
+
+    fn filter_key(&mut self, key: KeyEvent) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Esc => return self.clear_filter(),
+            KeyCode::Enter => return,
+            KeyCode::Down => self.move_by(1),
+            KeyCode::Up => self.move_by(-1),
+            KeyCode::Char('n') if ctrl => self.move_by(1),
+            KeyCode::Char('p') if ctrl => self.move_by(-1),
+            KeyCode::Char('u') if ctrl => self.set_filter(String::new()),
+            KeyCode::Char('w') if ctrl => {
+                let keep = self.filter[..word_start(&self.filter)].to_string();
+                self.set_filter(keep);
+            }
+            // Backspace on an empty filter leaves filtering, as in a shell prompt.
+            KeyCode::Backspace if self.filter.is_empty() => return,
+            KeyCode::Backspace => {
+                let mut f = self.filter.clone();
+                f.pop();
+                self.set_filter(f);
+            }
+            KeyCode::Char(c) if !ctrl => {
+                let f = format!("{}{c}", self.filter);
+                self.set_filter(f);
+            }
+            _ => {}
+        }
+        self.mode = Mode::Filter;
+    }
+
+    fn set_filter(&mut self, filter: String) {
+        self.filter = filter;
+        self.offset = 0;
+        self.rebuild_view(None);
+    }
+
+    fn clear_filter(&mut self) {
+        let keep = self.selected().map(|e| e.name.clone());
+        self.filter.clear();
+        self.rebuild_view(keep.as_deref());
+    }
+
+    fn input_key(&mut self, mut input: Input, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => {}
+            KeyCode::Enter => self.submit(input),
+            _ => {
+                input.edit(key);
+                self.mode = Mode::Input(input);
+            }
+        }
+    }
+
+    fn submit(&mut self, input: Input) {
+        let text = input.text.trim();
+        if text.is_empty() {
+            return;
+        }
+        let created = match input.kind {
+            InputKind::Rename(from) => ops::rename(&from, text).map(|()| text.to_string()),
+            InputKind::NewFile => ops::create(&self.cwd, text, false),
+            InputKind::NewDir => ops::create(&self.cwd, text, true),
+            InputKind::Jump => return self.jump(text),
+        };
+        match created {
+            Ok(name) => {
+                self.reload_selecting(Some(name));
+                self.sync_git(true);
+            }
+            Err(e) => self.error(e.to_string()),
+        }
+    }
+
+    fn jump(&mut self, text: &str) {
+        let expanded = match (text.strip_prefix('~'), env::var_os("HOME")) {
+            (Some(rest), Some(home)) => format!("{}{rest}", home.to_string_lossy()),
+            _ => text.to_string(),
+        };
+        let path = self.cwd.join(expanded);
+        match std::fs::canonicalize(&path) {
+            Ok(p) if p.is_dir() => self.enter(p, None),
+            Ok(p) => {
+                let name = p.file_name().map(|n| n.to_string_lossy().into_owned());
+                let parent = p.parent().unwrap_or(&p).to_path_buf();
+                self.enter(parent, name);
+            }
+            Err(e) => self.error(format!("{text}: {e}")),
+        }
+    }
+
+    fn confirm_key(&mut self, confirm: Confirm, key: KeyEvent) {
+        if !matches!(key.code, KeyCode::Char('y' | 'Y')) {
+            return self.info("cancelled");
+        }
+        match confirm {
+            Confirm::Trash(paths) => self.trash(paths),
+        }
+    }
+
+    fn goto_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Char('g') => self.move_to(0),
+            KeyCode::Char('h' | '~') => match env::var_os("HOME") {
+                Some(home) => self.enter(home.into(), None),
+                None => self.error("HOME is not set"),
+            },
+            KeyCode::Char('r') => match self.git.as_ref().map(|r| r.root.clone()) {
+                Some(root) => self.enter(root, None),
+                None => self.error("not in a git repository"),
+            },
+            KeyCode::Char('/') => self.enter(PathBuf::from("/"), None),
+            _ => {}
+        }
+    }
+
+    fn move_by(&mut self, delta: isize) {
+        let next = self.selected.saturating_add_signed(delta);
+        self.move_to(next);
+    }
+
+    fn move_to(&mut self, index: usize) {
+        self.selected = index;
+        self.clamp();
+    }
+
+    fn scroll_preview(&mut self, delta: isize) {
+        let max = match &self.preview {
+            Some((_, Preview::Text(lines))) => lines.len().saturating_sub(1),
+            Some((_, Preview::Dir(entries))) => entries.len().saturating_sub(1),
+            _ => 0,
+        };
+        self.preview_scroll = self.preview_scroll.saturating_add_signed(delta).min(max);
+    }
+
+    fn enter(&mut self, dir: PathBuf, select: Option<String>) {
+        self.go(dir, select, true);
+    }
+
+    fn go(&mut self, dir: PathBuf, select: Option<String>, record: bool) {
+        let from = self.cwd.clone();
+        match std::fs::canonicalize(&dir).and_then(|d| self.load(d, select)) {
+            Ok(()) if record && from != self.cwd => self.back.push(from),
+            Ok(()) => {}
+            Err(e) => self.error(format!("{}: {e}", dir.display())),
+        }
+    }
+
+    fn up(&mut self) {
+        if let Some(parent) = self.cwd.parent().map(Path::to_path_buf) {
+            let name = self
+                .cwd
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned());
+            self.enter(parent, name);
+        }
+    }
+
+    fn go_back(&mut self) {
+        match self.back.pop() {
+            Some(dir) => self.go(dir, None, false),
+            None => self.info("no previous directory"),
+        }
+    }
+
+    fn open(&mut self) -> Option<Effect> {
+        let entry = self.selected()?;
+        if entry.is_dir {
+            let path = entry.path.clone();
+            self.enter(path, None);
+            None
+        } else {
+            self.edit()
+        }
+    }
+
+    fn edit(&mut self) -> Option<Effect> {
+        let files: Vec<PathBuf> = self.targets().into_iter().filter(|p| !p.is_dir()).collect();
+        if files.is_empty() {
+            return None;
+        }
+        let editor = env::var("VISUAL")
+            .or_else(|_| env::var("EDITOR"))
+            .unwrap_or_else(|_| "vi".into());
+        let mut cmd = Command::new("sh");
+        // Through sh so an editor set as `code -w` or with quoted arguments works as in a shell.
+        cmd.arg("-c")
+            .arg(format!("{editor} \"$@\""))
+            .arg("sh")
+            .args(&files)
+            .current_dir(&self.cwd);
+        Some(Effect::Run(cmd))
+    }
+
+    fn shell(&self) -> Effect {
+        let shell = env::var_os("SHELL").unwrap_or_else(|| "sh".into());
+        let mut cmd = Command::new(shell);
+        cmd.current_dir(&self.cwd);
+        Effect::Run(cmd)
+    }
+
+    fn open_external(&mut self) {
+        let opener = if cfg!(target_os = "macos") {
+            "open"
+        } else {
+            "xdg-open"
+        };
+        for path in self.targets() {
+            // Null stdio: a launched app inheriting our pipes would otherwise keep us waiting.
+            let status = Command::new(opener)
+                .arg(&path)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+            match status {
+                Ok(s) if s.success() => {}
+                Ok(s) => return self.error(format!("{opener} {}: {s}", path.display())),
+                Err(e) => return self.error(format!("{opener}: {e}")),
+            }
+        }
+    }
+
+    fn copy_paths(&mut self) {
+        let paths = self.targets();
+        if paths.is_empty() {
+            return;
+        }
+        let text: Vec<_> = paths.iter().map(|p| p.to_string_lossy()).collect();
+        match ops::copy_to_clipboard(&text.join("\n")) {
+            Ok(()) if paths.len() == 1 => self.info(format!("copied {}", text[0])),
+            Ok(()) => self.info(format!("copied {} paths", paths.len())),
+            Err(e) => self.error(e.to_string()),
+        }
+    }
+
+    fn resort(&mut self) {
+        let keep = self.selected().map(|e| e.name.clone());
+        dir::sort(&mut self.entries, self.sort, self.reverse);
+        dir::sort(&mut self.parent, self.sort, self.reverse);
+        self.parent_selected = self.parent.iter().position(|e| e.path == self.cwd);
+        self.rebuild_view(keep.as_deref());
+        let order = if self.reverse { "reversed" } else { "" };
+        self.info(
+            format!("sort by {} {order}", self.sort.label())
+                .trim_end()
+                .to_string(),
+        );
+    }
+
+    fn toggle_mark(&mut self) {
+        if let Some(path) = self.selected().map(|e| e.path.clone()) {
+            if !self.marked.remove(&path) {
+                self.marked.insert(path);
+            }
+            self.move_by(1);
+        }
+    }
+
+    fn yank(&mut self, cut: bool) {
+        let paths = self.targets();
+        if paths.is_empty() {
+            return;
+        }
+        let verb = if cut { "cut" } else { "copied" };
+        self.info(format!("{verb} {} — p to paste", count(paths.len())));
+        self.clip = Some(Clip { paths, cut });
+        self.marked.clear();
+    }
+
+    fn paste(&mut self) {
+        let Some(clip) = self.clip.take() else {
+            return self.info("nothing to paste");
+        };
+        let mut done = 0;
+        let mut last = None;
+        let mut failure = None;
+        for src in &clip.paths {
+            if clip.cut && src.parent() == Some(self.cwd.as_path()) {
+                continue;
+            }
+            if src.is_dir() && self.cwd.starts_with(src) {
+                failure = Some(format!("cannot paste {} into itself", src.display()));
+                break;
+            }
+            let result = src
+                .file_name()
+                .map(|n| ops::unique_dest(&self.cwd, &n.to_string_lossy()))
+                .ok_or_else(|| io::Error::other("no file name"))
+                .and_then(|dst| {
+                    if clip.cut {
+                        ops::move_path(src, &dst)
+                    } else {
+                        ops::copy_all(src, &dst)
+                    }
+                    .map(|()| dst)
+                });
+            match result {
+                Ok(dst) => {
+                    done += 1;
+                    last = dst.file_name().map(|n| n.to_string_lossy().into_owned());
+                }
+                Err(e) => {
+                    failure = Some(format!("{}: {e}", src.display()));
+                    break;
+                }
+            }
+        }
+        let total = clip.paths.len();
+        // A copy can be pasted again; a cut has moved its files and is spent.
+        if !clip.cut {
+            self.clip = Some(clip);
+        }
+        self.reload_selecting(last.or_else(|| self.selected().map(|e| e.name.clone())));
+        self.sync_git(true);
+        match failure {
+            Some(f) => self.error(format!("pasted {done} of {total}: {f}")),
+            None => self.info(format!("pasted {}", count(done))),
+        }
+    }
+
+    fn trash(&mut self, paths: Vec<PathBuf>) {
+        let Some(trash) = self.trash.clone() else {
+            return self.error("no trash directory: HOME is not set");
+        };
+        let mut done = 0;
+        let mut failure = None;
+        for path in &paths {
+            match trash.put(path) {
+                Ok(_) => {
+                    done += 1;
+                    self.marked.remove(path);
+                }
+                Err(e) => {
+                    failure = Some(format!("{}: {e}", path.display()));
+                    break;
+                }
+            }
+        }
+        // The item under the cursor is gone; stay at the same row rather than jumping to the top.
+        let row = self.selected;
+        self.reload();
+        self.move_to(row);
+        self.sync_git(true);
+        match failure {
+            Some(f) => self.error(format!("trashed {done} of {}: {f}", paths.len())),
+            None => self.info(format!("moved {} to trash", count(done))),
+        }
+    }
+}
+
+fn count(n: usize) -> String {
+    if n == 1 {
+        "1 item".into()
+    } else {
+        format!("{n} items")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dir::testutil::TempDir;
+    use std::fs;
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn press(app: &mut App, keys: &str) {
+        for c in keys.chars() {
+            let code = match c {
+                '\n' => KeyCode::Enter,
+                '\x1b' => KeyCode::Esc,
+                c => KeyCode::Char(c),
+            };
+            assert!(
+                app.handle_key(key(code)).is_none(),
+                "{c:?} should not need the terminal"
+            );
+        }
+    }
+
+    fn names(app: &App) -> Vec<&str> {
+        app.view
+            .iter()
+            .map(|v| app.entries[v.idx].name.as_str())
+            .collect()
+    }
+
+    fn setup() -> (TempDir, App) {
+        let tmp = TempDir::new();
+        tmp.file("src/main.rs", "fn main() {}\n");
+        tmp.file("src/app.rs", "");
+        tmp.file("README.md", "# hi\n");
+        tmp.file("Cargo.toml", "");
+        tmp.file(".env", "");
+        let app = App::new(tmp.path(), Some(Trash::Dir(tmp.path().join(".trash")))).unwrap();
+        (tmp, app)
+    }
+
+    #[test]
+    fn lists_directories_first_and_hides_dotfiles() {
+        let (_tmp, app) = setup();
+        assert_eq!(names(&app), ["src", "Cargo.toml", "README.md"]);
+        assert_eq!(app.selected().unwrap().name, "src");
+    }
+
+    #[test]
+    fn opening_a_file_path_selects_it() {
+        let (tmp, _) = setup();
+        let app = App::new(&tmp.path().join("README.md"), None).unwrap();
+        assert_eq!(app.cwd, tmp.path());
+        assert_eq!(app.selected().unwrap().name, "README.md");
+    }
+
+    #[test]
+    fn enter_and_leave_remember_position() {
+        let (tmp, mut app) = setup();
+        press(&mut app, "l");
+        assert_eq!(app.cwd, tmp.path().join("src"));
+        press(&mut app, "j");
+        assert_eq!(app.selected().unwrap().name, "main.rs");
+        press(&mut app, "h");
+        assert_eq!(app.cwd, tmp.path());
+        assert_eq!(app.selected().unwrap().name, "src");
+        press(&mut app, "l");
+        assert_eq!(app.selected().unwrap().name, "main.rs");
+        press(&mut app, "-");
+        assert_eq!(app.cwd, tmp.path());
+    }
+
+    #[test]
+    fn fuzzy_filter_narrows_and_esc_restores() {
+        let (_tmp, mut app) = setup();
+        press(&mut app, "/rdm");
+        assert!(matches!(app.mode, Mode::Filter));
+        assert_eq!(names(&app), ["README.md"]);
+        press(&mut app, "\n");
+        assert!(matches!(app.mode, Mode::Normal));
+        assert_eq!(names(&app), ["README.md"]);
+        press(&mut app, "\x1b");
+        assert_eq!(names(&app).len(), 3);
+        assert_eq!(app.selected().unwrap().name, "README.md");
+    }
+
+    #[test]
+    fn toggles_hidden_files() {
+        let (_tmp, mut app) = setup();
+        press(&mut app, ".");
+        assert!(names(&app).contains(&".env"));
+    }
+
+    #[test]
+    fn creates_files_and_directories() {
+        let (tmp, mut app) = setup();
+        press(&mut app, "adocs/notes.md\n");
+        assert!(tmp.path().join("docs/notes.md").is_file());
+        assert_eq!(app.selected().unwrap().name, "docs");
+        press(&mut app, "Abuild\n");
+        assert!(tmp.path().join("build").is_dir());
+        press(&mut app, "aREADME.md\n");
+        assert!(app.message().unwrap().error);
+    }
+
+    #[test]
+    fn rename_starts_with_cursor_before_extension() {
+        let (tmp, mut app) = setup();
+        press(&mut app, "G");
+        assert_eq!(app.selected().unwrap().name, "README.md");
+        press(&mut app, "r");
+        let Mode::Input(input) = &app.mode else {
+            panic!("expected input")
+        };
+        assert_eq!(input.cursor, "README".len());
+        press(&mut app, "-old\n");
+        assert!(tmp.path().join("README-old.md").exists());
+        assert_eq!(app.selected().unwrap().name, "README-old.md");
+    }
+
+    #[test]
+    fn copy_paste_and_cut_paste() {
+        let (tmp, mut app) = setup();
+        press(&mut app, "Gyp");
+        assert!(tmp.path().join("README copy.md").exists());
+        press(&mut app, "k");
+        assert_eq!(app.selected().unwrap().name, "Cargo.toml");
+        press(&mut app, "xggl");
+        press(&mut app, "p");
+        assert!(tmp.path().join("src/Cargo.toml").exists());
+        assert!(!tmp.path().join("Cargo.toml").exists());
+        assert!(app.clip.is_none());
+    }
+
+    #[test]
+    fn pasting_a_directory_into_itself_is_refused() {
+        let (tmp, mut app) = setup();
+        press(&mut app, "ylp");
+        assert!(app.message().unwrap().error);
+        assert!(!tmp.path().join("src/src").exists());
+    }
+
+    #[test]
+    fn marks_then_trash_after_confirmation() {
+        let (tmp, mut app) = setup();
+        press(&mut app, "j  ");
+        assert_eq!(app.marked.len(), 2);
+        press(&mut app, "dn");
+        assert!(tmp.path().join("Cargo.toml").exists());
+        press(&mut app, "dy");
+        assert!(!tmp.path().join("Cargo.toml").exists());
+        assert!(!tmp.path().join("README.md").exists());
+        assert!(tmp.path().join(".trash/README.md").exists());
+        assert!(app.marked.is_empty());
+        assert_eq!(names(&app), ["src"]);
+    }
+
+    #[test]
+    fn jump_goes_to_a_path() {
+        let (tmp, mut app) = setup();
+        press(&mut app, ":src/app.rs\n");
+        assert_eq!(app.cwd, tmp.path().join("src"));
+        assert_eq!(app.selected().unwrap().name, "app.rs");
+    }
+
+    #[test]
+    fn preview_arrives_from_the_worker() {
+        let (_tmp, mut app) = setup();
+        app.sync_preview();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !app.poll_preview() {
+            assert!(Instant::now() < deadline, "preview never arrived");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            matches!(&app.preview, Some((p, Preview::Dir(entries))) if p.ends_with("src") && entries.len() == 2)
+        );
+    }
+
+    #[test]
+    fn notices_changes_on_disk() {
+        let (tmp, mut app) = setup();
+        // mtime granularity can be a second on some filesystems; wait it out.
+        std::thread::sleep(Duration::from_millis(1100));
+        fs::write(tmp.path().join("new.txt"), "").unwrap();
+        assert!(app.tick());
+        assert!(names(&app).contains(&"new.txt"));
+    }
+
+    #[test]
+    fn alt_chords_do_nothing() {
+        let (_tmp, mut app) = setup();
+        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::ALT));
+        assert_eq!(app.selected, 0);
+    }
+
+    #[test]
+    fn word_start_splits_on_separators() {
+        assert_eq!(word_start("foo bar"), 4);
+        assert_eq!(word_start("src/app/"), 4);
+        assert_eq!(word_start("word"), 0);
+    }
+}

@@ -1,0 +1,365 @@
+#!/bin/sh
+# One unit of work, one worktree, one branch, one pull request.
+#
+# Every subcommand says what it is about to do, is safe to run twice, and fails
+# with a non-zero status and something you can act on. Nothing here ever runs
+# git with --no-verify: the hooks are the point.
+set -eu
+
+# Kept in step with .githooks/commit-msg, which applies the same test to every
+# commit message. Both are deliberately narrow, so ordinary prose about tools
+# and generated files does not trip them.
+ATTRIBUTION='(co-authored-by:.*(claude|anthropic|copilot|chatgpt|openai|gemini|cursor|codeium|\[bot\]))|(generated (with|by) +(claude|chatgpt|copilot|cursor|an? (ai|assistant|llm)))|(🤖)|(made with (claude|ai))|(as an ai)|(anthropic\.com)'
+
+BRANCH_RE='^(feat|fix|chore|docs|perf|refactor|test)/[a-z0-9][a-z0-9._-]*$'
+COMMIT_RE='^(feat|fix|chore|docs|perf|refactor|test|build|ci|style|revert)(\([a-z0-9._/-]+\))?!?: [^ ].*'
+
+die() {
+  printf 'agent: %s\n' "$1" >&2
+  exit 1
+}
+
+say() {
+  printf '▸ %s\n' "$1"
+}
+
+root() {
+  git rev-parse --show-toplevel 2>/dev/null || die 'not inside a git repository'
+}
+
+# The primary checkout, even when we are standing in a worktree.
+primary() {
+  git worktree list --porcelain | awk '/^worktree /{ sub(/^worktree /, ""); print; exit }'
+}
+
+repo_name() {
+  basename "$(primary)"
+}
+
+# Resolved, never assumed: a repository whose default branch is `trunk` has to
+# work without editing this script.
+default_branch() {
+  b=$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null || true)
+  b=${b#origin/}
+  if [ -z "$b" ] && git remote get-url origin >/dev/null 2>&1; then
+    git remote set-head origin --auto >/dev/null 2>&1 || true
+    b=$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null || true)
+    b=${b#origin/}
+  fi
+  [ -n "$b" ] || b=$(git config --get init.defaultBranch 2>/dev/null || true)
+  [ -n "$b" ] || b=main
+  printf '%s' "$b"
+}
+
+worktree_dir() {
+  printf '%s/.worktrees/%s/%s' "$(dirname "$(primary)")" "$(repo_name)" "$1"
+}
+
+has_origin() {
+  git remote get-url origin >/dev/null 2>&1
+}
+
+require_clean() {
+  [ -z "$(git status --porcelain)" ] || die 'working tree is dirty; commit or stash first'
+}
+
+# ── doctor ──────────────────────────────────────────────────────────────────
+# Reports every problem it finds rather than stopping at the first, because
+# being told about one missing thing at a time is how a five-minute setup takes
+# an afternoon.
+
+cmd_doctor() {
+  problems=0
+  note() {
+    printf '  \033[31m✗\033[0m %s\n' "$1"
+    problems=$((problems + 1))
+  }
+  ok() {
+    printf '  \033[32m✓\033[0m %s\n' "$1"
+  }
+
+  say 'checking this checkout'
+
+  if command -v git >/dev/null 2>&1; then
+    ok "git $(git --version | awk '{print $3}')"
+  else
+    note 'git is not installed'
+  fi
+
+  if command -v gh >/dev/null 2>&1; then
+    if gh auth status >/dev/null 2>&1; then
+      ok "gh authenticated as $(gh api user --jq .login 2>/dev/null || echo '?')"
+    else
+      note 'gh is installed but not authenticated — run: gh auth login'
+    fi
+  else
+    note 'gh is not installed — https://cli.github.com'
+  fi
+
+  if command -v cargo >/dev/null 2>&1; then
+    ok "$(rustc --version)"
+  else
+    note 'no cargo on PATH — install Rust from https://rustup.rs'
+  fi
+
+  hooks=$(git config --get core.hooksPath 2>/dev/null || true)
+  if [ "$hooks" = '.githooks' ]; then
+    ok 'hooks: core.hooksPath = .githooks'
+  else
+    git config core.hooksPath .githooks
+    ok 'hooks: core.hooksPath set to .githooks'
+  fi
+  for hook in commit-msg pre-commit pre-push; do
+    [ -x ".githooks/$hook" ] || note ".githooks/$hook is missing or not executable"
+  done
+
+  if has_origin; then
+    ok "origin: $(git remote get-url origin)"
+    ok "default branch: $(default_branch)"
+  else
+    note 'no origin remote — run: gh repo create --source=. --remote=origin --push'
+  fi
+
+  if [ -z "$(git status --porcelain)" ]; then
+    ok 'working tree is clean'
+  else
+    note 'working tree is dirty'
+  fi
+
+  if [ "$problems" -eq 0 ]; then
+    printf '\n\033[1;32m✓ ready\033[0m\n'
+  else
+    printf '\n%s problem(s) above.\n' "$problems" >&2
+    exit 1
+  fi
+}
+
+# ── start ───────────────────────────────────────────────────────────────────
+
+cmd_start() {
+  branch=${1:-}
+  [ -n "$branch" ] || die 'usage: scripts/agent start <type>/<slug>'
+  printf '%s' "$branch" | grep -Eq "$BRANCH_RE" ||
+    die "branch name must match $BRANCH_RE (feat, fix, chore, docs, perf, refactor, test)"
+
+  dir=$(worktree_dir "$branch")
+  [ ! -e "$dir" ] || die "$dir already exists; scripts/agent done $branch first"
+  ! git show-ref --verify --quiet "refs/heads/$branch" ||
+    die "branch $branch already exists"
+
+  base=$(default_branch)
+  if has_origin; then
+    say "fetching origin"
+    git fetch --quiet origin
+    from="origin/$base"
+    git rev-parse --verify --quiet "$from" >/dev/null ||
+      die "origin has no branch $base"
+  else
+    from=$base
+    say "no origin yet; branching from local $base"
+  fi
+
+  say "creating $branch from $from"
+  mkdir -p "$(dirname "$dir")"
+  git worktree add --quiet -b "$branch" "$dir" "$from"
+
+  printf '\nworktree ready:\n\n  cd %s\n\n' "$dir"
+}
+
+# ── check ───────────────────────────────────────────────────────────────────
+
+cmd_check() {
+  exec "$(root)/scripts/task" check
+}
+
+# ── commit ──────────────────────────────────────────────────────────────────
+
+cmd_commit() {
+  [ $# -gt 0 ] || die 'usage: scripts/agent commit "type(scope): subject"'
+  message=$1
+  shift
+
+  subject=$(printf '%s' "$message" | head -1)
+  printf '%s' "$subject" | grep -Eq "$COMMIT_RE" ||
+    die "not a conventional commit: $subject
+  expected: type(scope): subject
+  types:    feat fix chore docs perf refactor test build ci style revert"
+  [ "${#subject}" -le 72 ] || die "subject is ${#subject} characters; keep it under 72"
+  case "$subject" in
+  *.) die 'subject must not end with a period' ;;
+  esac
+  if printf '%s' "$message" | grep -Eiq "$ATTRIBUTION"; then
+    die 'commit message names an assistant; this project publishes under its own name'
+  fi
+
+  say 'committing'
+  git commit -m "$message" "$@"
+}
+
+# ── pr ──────────────────────────────────────────────────────────────────────
+
+cmd_pr() {
+  draft=''
+  if [ "${1:-}" = '--draft' ]; then
+    draft='--draft'
+  fi
+
+  branch=$(git rev-parse --abbrev-ref HEAD)
+  base=$(default_branch)
+  [ "$branch" != "$base" ] || die "you are on $base; scripts/agent start <type>/<slug> first"
+  has_origin || die 'no origin remote to open a pull request against'
+  require_clean
+
+  say 'running scripts/task check'
+  "$(root)/scripts/task" check
+
+  say "pushing $branch"
+  git push --quiet -u origin "$branch"
+
+  # State, not existence: `gh pr view` happily returns a closed or merged pull
+  # request for this branch, and treating one of those as open leaves the work
+  # pushed with nothing to review it.
+  state=$(gh pr view --json state --jq .state 2>/dev/null || echo 'NONE')
+  if [ "$state" = 'OPEN' ]; then
+    url=$(gh pr view --json url --jq .url)
+    say "pull request already open: $url"
+  else
+    say 'opening the pull request'
+    template="$(primary)/.github/PULL_REQUEST_TEMPLATE.md"
+    # The first commit on the branch, not the last: a branch usually opens with
+    # the change it is named after and ends with the housekeeping, and titling
+    # the pull request after the housekeeping buries the point of it.
+    title=$(git log --reverse --format=%s "origin/$base..HEAD" | head -1)
+    [ -n "$title" ] || title=$(git log -1 --pretty=%s)
+    if [ -f "$template" ]; then
+      gh pr create --base "$base" --head "$branch" --title "$title" \
+        --body-file "$template" $draft >/dev/null
+    else
+      gh pr create --base "$base" --head "$branch" --fill $draft >/dev/null
+    fi
+    url=$(gh pr view --json url --jq .url)
+  fi
+
+  # Belt and braces: a body assembled from commits, a template, or anything
+  # else must not carry attribution onto a public repository.
+  if gh pr view --json body --jq .body | grep -Eiq "$ATTRIBUTION"; then
+    say 'stripping attribution from the pull request body'
+    gh pr view --json body --jq .body |
+      grep -Eiv "$ATTRIBUTION" |
+      gh pr edit --body-file - >/dev/null
+  fi
+
+  printf '\n%s\n' "$url"
+}
+
+# ── sync ────────────────────────────────────────────────────────────────────
+
+cmd_sync() {
+  base=$(default_branch)
+  branch=$(git rev-parse --abbrev-ref HEAD)
+  [ "$branch" != "$base" ] || die "already on $base; nothing to rebase"
+  has_origin || die 'no origin remote to rebase onto'
+  require_clean
+
+  say "fetching origin"
+  git fetch --quiet origin
+  say "rebasing $branch onto origin/$base"
+  git rebase "origin/$base"
+}
+
+# ── done ────────────────────────────────────────────────────────────────────
+
+cmd_done() {
+  branch=${1:-$(git rev-parse --abbrev-ref HEAD)}
+  base=$(default_branch)
+  [ "$branch" != "$base" ] ||
+    die "usage: scripts/agent done <branch> — $base is not a branch to finish"
+
+  dir=$(worktree_dir "$branch")
+  here=$(root)
+  if [ "$here" = "$dir" ]; then
+    die "you are standing in the worktree being removed. Run:
+
+  cd $(primary) && scripts/agent done $branch"
+  fi
+
+  if has_origin; then
+    state=$(gh pr view "$branch" --json state --jq .state 2>/dev/null || echo 'NONE')
+    case "$state" in
+    MERGED) say "pull request for $branch is merged" ;;
+    NONE) die "no pull request found for $branch; scripts/agent pr first" ;;
+    *) die "the pull request for $branch is $state, not MERGED" ;;
+    esac
+  fi
+
+  if [ -d "$dir" ]; then
+    say "removing worktree $dir"
+    git worktree remove "$dir"
+  fi
+  if git show-ref --verify --quiet "refs/heads/$branch"; then
+    say "deleting local branch $branch"
+    git branch -D "$branch" >/dev/null
+  fi
+  say 'pruning'
+  git worktree prune
+  rmdir "$(dirname "$dir")" 2>/dev/null || true
+  if has_origin; then
+    git fetch --quiet --prune origin
+  fi
+  printf '\ndone.\n'
+}
+
+# ── list ────────────────────────────────────────────────────────────────────
+
+cmd_list() {
+  printf '%-28s %-42s %s\n' 'BRANCH' 'WORKTREE' 'PULL REQUEST'
+  git worktree list --porcelain | awk '
+    /^worktree /{ dir = substr($0, 10) }
+    /^branch /  { sub("refs/heads/", "", $2); print $2 "\t" dir }
+    /^detached/ { print "(detached)\t" dir }
+  ' | while IFS="$(printf '\t')" read -r branch dir; do
+    state='—'
+    if has_origin; then
+      state=$(gh pr view "$branch" --json number,state \
+        --jq '"#" + (.number|tostring) + " " + .state' 2>/dev/null || echo '—')
+    fi
+    printf '%-28s %-42s %s\n' "$branch" "$dir" "$state"
+  done
+}
+
+usage() {
+  cat <<'USAGE'
+usage: scripts/agent <command>
+
+  doctor                 check this checkout is ready to work in
+  start <type>/<slug>    a branch and a worktree of its own
+  check                  scripts/task check
+  commit <message>       validate the message, then commit
+  pr [--draft]           check, push, and open the pull request
+  sync                   rebase onto the default branch
+  done [branch]          confirm merged, then remove the worktree and branch
+  list                   worktrees, their branches, and their pull requests
+
+Branches are <type>/<slug>: feat fix chore docs perf refactor test.
+Worktrees live in ../.worktrees/<repo>/<branch>/.
+USAGE
+}
+
+command=${1:-}
+[ $# -gt 0 ] && shift || true
+case "$command" in
+doctor) cmd_doctor "$@" ;;
+start) cmd_start "$@" ;;
+check) cmd_check "$@" ;;
+commit) cmd_commit "$@" ;;
+pr) cmd_pr "$@" ;;
+sync) cmd_sync "$@" ;;
+done) cmd_done "$@" ;;
+list) cmd_list "$@" ;;
+-h | --help | help) usage ;;
+*)
+  printf 'agent: unknown command %s\n\n' "${command:-<none>}" >&2
+  usage >&2
+  exit 2
+  ;;
+esac

@@ -1,0 +1,17 @@
+#!/bin/sh
+# Formatting and lint, before anything is recorded.
+#
+# The whole tree rather than the staged files: cargo has no per-file mode worth
+# using, and a warm clippy on this project takes about a second — well inside what
+# a commit can absorb. The test suite belongs in pre-push, where it can take as
+# long as it takes.
+set -eu
+
+cd "$(git rev-parse --show-toplevel)"
+
+printf 'pre-commit: format and lint\n'
+if ! scripts/task fmt:check; then
+  printf '\npre-commit: formatting has drifted. Run:\n\n  scripts/task fmt\n\n' >&2
+  exit 1
+fi
+scripts/task lint

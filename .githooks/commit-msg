@@ -1,0 +1,43 @@
+#!/bin/sh
+# Every commit message is a Conventional Commit, and no commit message names an
+# assistant. Both are checked here rather than in review, because a message is
+# expensive to change once it is somebody else's history.
+set -eu
+
+file=$1
+
+# Kept in step with scripts/agent. Deliberately narrow, so ordinary prose about
+# tools and generated files does not trip it.
+ATTRIBUTION='(co-authored-by:.*(claude|anthropic|copilot|chatgpt|openai|gemini|cursor|codeium|\[bot\]))|(generated (with|by) +(claude|chatgpt|copilot|cursor|an? (ai|assistant|llm)))|(🤖)|(made with (claude|ai))|(as an ai)|(anthropic\.com)'
+COMMIT_RE='^(feat|fix|chore|docs|perf|refactor|test|build|ci|style|revert)(\([a-z0-9._/-]+\))?!?: [^ ].*'
+
+reject() {
+  printf '\ncommit-msg: %s\n\n' "$1" >&2
+  printf '  a commit message is:  type(scope): subject\n' >&2
+  printf '  types:                feat fix chore docs perf refactor test build ci style revert\n' >&2
+  printf '  subject:              imperative, under 72 characters, no trailing period\n\n' >&2
+  printf '  the body explains why; the diff already says what.\n\n' >&2
+  exit 1
+}
+
+if grep -Eiq "$ATTRIBUTION" "$file"; then
+  printf '\ncommit-msg: this message names an assistant.\n\n' >&2
+  printf '  Work in this repository is published under its own name. Remove the\n' >&2
+  printf '  trailer or footer and commit again.\n\n' >&2
+  exit 1
+fi
+
+subject=$(grep -v '^#' "$file" | grep -v '^[[:space:]]*$' | head -1)
+[ -n "$subject" ] || reject 'the message is empty'
+
+# A rebase writes these itself, and squash-merging on the server means a merge
+# commit here is somebody else's history rather than a message to hold to.
+case "$subject" in
+"Merge "* | "Revert "* | "fixup!"* | "squash!"* | "amend!"*) exit 0 ;;
+esac
+
+printf '%s' "$subject" | grep -Eq "$COMMIT_RE" || reject "not a conventional commit: $subject"
+[ "${#subject}" -le 72 ] || reject "the subject is ${#subject} characters"
+case "$subject" in
+*.) reject 'the subject ends with a period' ;;
+esac

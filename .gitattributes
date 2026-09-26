@@ -1,0 +1,8 @@
+# One line ending everywhere, so a checkout on another platform does not churn.
+* text=auto eol=lf
+
+# Recorded screens are byte-exact by definition.
+*.snap text eol=lf
+
+# Not written by hand, and not worth reviewing line by line.
+Cargo.lock linguist-generated=true

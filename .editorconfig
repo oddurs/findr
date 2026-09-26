@@ -1,0 +1,26 @@
+# Matches rustfmt's defaults exactly; the formatter is the authority and this
+# file only stops an editor from fighting it before the formatter runs.
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 4
+
+[*.rs]
+indent_size = 4
+max_line_length = 100
+
+[*.{yml,yaml,json,toml}]
+indent_size = 2
+
+[{scripts/*,.githooks/*}]
+indent_size = 2
+
+[*.md]
+indent_size = 2
+# Two trailing spaces are a line break in Markdown.
+trim_trailing_whitespace = false

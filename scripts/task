@@ -1,0 +1,63 @@
+#!/bin/sh
+# The seam between this project and everything that automates it.
+#
+# CI, the git hooks and scripts/agent know only the verbs below. Nothing outside
+# this file knows findr is written in Rust, which keeps CI and a local hook from
+# drifting apart: they run the same line.
+set -eu
+
+cd "$(dirname "$0")/.."
+
+step() {
+  printf '\n\033[1;34m▸ %s\033[0m\n' "$1"
+}
+
+usage() {
+  cat <<'USAGE'
+usage: scripts/task <target>
+
+  fmt        format in place
+  fmt:check  verify formatting; non-zero on drift
+  lint       lint; warnings are errors
+  test       the full test suite
+  build      compile everything, including the tests
+  check      fmt:check, lint, test, build — what CI runs
+USAGE
+}
+
+case "${1:-}" in
+  fmt)
+    cargo fmt --all
+    ;;
+  fmt:check)
+    cargo fmt --all -- --check
+    ;;
+  lint)
+    cargo clippy --all-targets --all-features --locked -- -D warnings
+    ;;
+  test)
+    cargo test --all-targets --locked
+    ;;
+  build)
+    cargo build --all-targets --locked
+    ;;
+  check)
+    step 'format'
+    "$0" fmt:check
+    step 'lint'
+    "$0" lint
+    step 'test'
+    "$0" test
+    step 'build'
+    "$0" build
+    printf '\n\033[1;32m✓ green\033[0m\n'
+    ;;
+  -h | --help | help)
+    usage
+    ;;
+  *)
+    printf 'scripts/task: unknown target %s\n\n' "${1:-<none>}" >&2
+    usage >&2
+    exit 2
+    ;;
+esac
