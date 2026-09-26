@@ -24,7 +24,13 @@ const MAX_HIGHLIGHT_LINE: usize = 2000;
 
 pub enum Preview {
     Dir(Vec<Entry>),
-    Text(Vec<Line<'static>>),
+    Text {
+        lines: Vec<Line<'static>>,
+        /// The grammar's name, such as "Rust" or "Plain Text".
+        syntax: String,
+        /// The file was longer than the preview reads.
+        truncated: bool,
+    },
     Note(String),
 }
 
@@ -92,11 +98,15 @@ fn build(req: &Request, highlighter: &mut Option<Highlighter>) -> Preview {
         return Preview::Note(format!("binary · {}", dir::human_size(meta.len())));
     }
     let text = String::from_utf8_lossy(&buf);
-    Preview::Text(
-        highlighter
-            .get_or_insert_with(Highlighter::new)
-            .highlight(&req.path, &text),
-    )
+    let (lines, syntax) = highlighter
+        .get_or_insert_with(Highlighter::new)
+        .highlight(&req.path, &text);
+    let truncated = meta.len() > MAX_BYTES || lines.len() == MAX_LINES;
+    Preview::Text {
+        lines,
+        syntax,
+        truncated,
+    }
 }
 
 struct Highlighter {
@@ -133,13 +143,15 @@ impl Highlighter {
             .unwrap_or_else(|| s.find_syntax_plain_text())
     }
 
-    fn highlight(&self, path: &Path, text: &str) -> Vec<Line<'static>> {
+    /// The highlighted lines and the name of the grammar used.
+    fn highlight(&self, path: &Path, text: &str) -> (Vec<Line<'static>>, String) {
         let lines: Vec<&str> = LinesWithEndings::from(text).take(MAX_LINES).collect();
         let syntax = self.syntax_for(path, lines.first().copied().unwrap_or(""));
+        let name = syntax.name.clone();
         let mut state = HighlightLines::new(syntax, &self.theme);
         let width = lines.len().to_string().len();
         let gutter = Style::new().fg(Color::DarkGray);
-        lines
+        let highlighted = lines
             .iter()
             .enumerate()
             .map(|(i, line)| {
@@ -160,7 +172,8 @@ impl Highlighter {
                 }
                 Line::from(spans)
             })
-            .collect()
+            .collect();
+        (highlighted, name)
     }
 }
 
@@ -227,11 +240,17 @@ mod tests {
     #[test]
     fn text_files_are_highlighted_with_line_numbers() {
         let tmp = TempDir::new();
-        let Preview::Text(lines) = preview(tmp.file("main.rs", "fn main() {\n\tlet x = 1;\n}\n"))
+        let Preview::Text {
+            lines,
+            syntax,
+            truncated,
+        } = preview(tmp.file("main.rs", "fn main() {\n\tlet x = 1;\n}\n"))
         else {
             panic!("expected text");
         };
         assert_eq!(lines.len(), 3);
+        assert_eq!(syntax, "Rust");
+        assert!(!truncated);
         assert_eq!(text(&lines[0]), "1 fn main() {");
         assert_eq!(text(&lines[1]), "2     let x = 1;");
         assert!(
@@ -283,7 +302,8 @@ mod tests {
     #[test]
     fn highlighted_lines_keep_tab_alignment() {
         let tmp = TempDir::new();
-        let Preview::Text(lines) = preview(tmp.file("Makefile", "a:\n\tb\nlong_name:\tc\n")) else {
+        let Preview::Text { lines, .. } = preview(tmp.file("Makefile", "a:\n\tb\nlong_name:\tc\n"))
+        else {
             panic!("expected text");
         };
         assert_eq!(text(&lines[1]), "2     b");

@@ -943,7 +943,7 @@ impl App {
 
     fn scroll_preview(&mut self, delta: isize) {
         let max = match &self.preview {
-            Some((_, Preview::Text(lines))) => lines.len().saturating_sub(1),
+            Some((_, Preview::Text { lines, .. })) => lines.len().saturating_sub(1),
             Some((_, Preview::Dir(entries))) => entries.len().saturating_sub(1),
             _ => 0,
         };
@@ -1585,7 +1585,13 @@ mod tests {
         assert_eq!(app.selected, 2, "clamped at the last entry");
         wheel(&mut app, MouseEventKind::ScrollUp, 15);
         assert_eq!(app.selected, 0);
-        app.preview = Some((app.cwd.clone(), Preview::Text(vec![Line::raw("x"); 10])));
+        let lines = vec![Line::raw("x"); 10];
+        let text = Preview::Text {
+            lines,
+            syntax: "Plain Text".into(),
+            truncated: false,
+        };
+        app.preview = Some((app.cwd.clone(), text));
         wheel(&mut app, MouseEventKind::ScrollDown, 40);
         assert_eq!(app.preview_scroll, WHEEL_STEP as usize);
         assert_eq!(app.selected, 0, "the list stays put under a preview scroll");
