@@ -6,6 +6,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
@@ -636,7 +637,10 @@ impl App {
     /// Writes the marked names to a list, one per line, for the editor to change.
     fn bulk_rename(&mut self) -> Option<Effect> {
         let originals: Vec<PathBuf> = self.marked.iter().cloned().collect();
-        let list = env::temp_dir().join(format!("findr-rename-{}.txt", std::process::id()));
+        // Unique per rename, not just per process: two renames must never share a list.
+        static RENAMES: AtomicUsize = AtomicUsize::new(0);
+        let n = RENAMES.fetch_add(1, Ordering::Relaxed);
+        let list = env::temp_dir().join(format!("findr-rename-{}-{n}.txt", std::process::id()));
         let names: String = originals
             .iter()
             .filter_map(|p| p.file_name())
@@ -1940,6 +1944,25 @@ mod tests {
         assert!(app.marked.is_empty());
         assert_eq!(app.message().unwrap().text, "renamed 1 item");
         assert!(!list.exists(), "the list is cleaned up");
+    }
+
+    #[test]
+    fn each_bulk_rename_gets_its_own_list() {
+        let (_one, mut a) = setup();
+        let (_two, mut b) = setup();
+        for app in [&mut a, &mut b] {
+            press(app, "j  ");
+            app.handle_key(key(KeyCode::Char('r')));
+        }
+        let list = |app: &App| app.bulk.as_ref().unwrap().list.clone();
+        assert_ne!(
+            list(&a),
+            list(&b),
+            "a shared list lets one rename read the other's names"
+        );
+        for app in [&a, &b] {
+            fs::remove_file(list(app)).unwrap();
+        }
     }
 
     #[test]
