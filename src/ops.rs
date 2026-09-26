@@ -79,6 +79,88 @@ pub fn rename(from: &Path, to: &str) -> io::Result<()> {
     fs::rename(from, dest)
 }
 
+/// Turns the edited list of names back into renames: line `i` is the new name for
+/// `originals[i]`. Unchanged lines are left out. Everything is checked before anything moves,
+/// so a mistake in the list renames nothing.
+pub fn plan_renames(
+    originals: &[PathBuf],
+    edited: &str,
+) -> Result<Vec<(PathBuf, PathBuf)>, String> {
+    let names: Vec<&str> = edited.lines().map(str::trim_end).collect();
+    // Editors differ on whether they leave a trailing blank line; one is not a missing name.
+    let names = match names.split_last() {
+        Some((last, rest)) if last.is_empty() && rest.len() == originals.len() => rest.to_vec(),
+        _ => names,
+    };
+    if names.len() != originals.len() {
+        return Err(format!(
+            "expected {} lines, found {}; nothing renamed",
+            originals.len(),
+            names.len()
+        ));
+    }
+    let mut plan = Vec::new();
+    for (from, name) in originals.iter().zip(&names) {
+        if name.is_empty() {
+            return Err(format!("{}: a name cannot be empty", from.display()));
+        }
+        if name.contains('/') {
+            return Err(format!("{name}: a name cannot contain /"));
+        }
+        let to = from.with_file_name(name);
+        if &to != from {
+            plan.push((from.clone(), to));
+        }
+    }
+    let mut targets = std::collections::BTreeSet::new();
+    for (from, to) in &plan {
+        if !targets.insert(to) {
+            return Err(format!("{} is named twice; nothing renamed", to.display()));
+        }
+        // Another item in the list may be moving out of the way; anything else is a clash.
+        let vacating = originals.contains(to);
+        let case_only = from.parent() == to.parent()
+            && name_of(from)
+                .ok()
+                .zip(name_of(to).ok())
+                .is_some_and(|(a, b)| a.eq_ignore_ascii_case(&b));
+        if occupied(to) && !vacating && !case_only {
+            return Err(format!("{} already exists; nothing renamed", to.display()));
+        }
+    }
+    Ok(plan)
+}
+
+/// Carries out a plan from `plan_renames`. Every source is first moved to a temporary name
+/// beside it, so swaps and chains (`a→b`, `b→a`) cannot collide, then to its final name.
+/// Returns how many were renamed.
+pub fn apply_renames(plan: &[(PathBuf, PathBuf)]) -> io::Result<usize> {
+    let staged: Vec<PathBuf> = plan
+        .iter()
+        .enumerate()
+        .map(|(i, (from, _))| {
+            from.with_file_name(format!(".findr-rename-{}-{i}", std::process::id()))
+        })
+        .collect();
+    for ((from, _), temp) in plan.iter().zip(&staged) {
+        fs::rename(from, temp)?;
+    }
+    for (done, ((_, to), temp)) in plan.iter().zip(&staged).enumerate() {
+        if let Err(e) = fs::rename(temp, to) {
+            return Err(io::Error::new(
+                e.kind(),
+                format!(
+                    "renamed {done} of {}; {} is left as {}: {e}",
+                    plan.len(),
+                    to.display(),
+                    temp.display()
+                ),
+            ));
+        }
+    }
+    Ok(plan.len())
+}
+
 /// Copies files, directories and symlinks (as links) from `src` to `dst`, which must not exist.
 pub fn copy_all(src: &Path, dst: &Path) -> io::Result<()> {
     let meta = fs::symlink_metadata(src)?;
@@ -309,6 +391,63 @@ mod tests {
         assert!(rename(&a, "x/y").is_err());
         rename(&a, "c").unwrap();
         assert_eq!(fs::read_to_string(tmp.path().join("c")).unwrap(), "1");
+    }
+
+    #[test]
+    fn a_rename_plan_is_checked_before_anything_moves() {
+        let tmp = TempDir::new();
+        let a = tmp.file("a.txt", "a");
+        let b = tmp.file("b.txt", "b");
+        tmp.file("taken.txt", "");
+        let originals = vec![a.clone(), b.clone()];
+        assert!(
+            plan_renames(&originals, "a.txt\n")
+                .unwrap_err()
+                .contains("expected 2 lines")
+        );
+        assert!(
+            plan_renames(&originals, "x\n\n")
+                .unwrap_err()
+                .contains("empty")
+        );
+        assert!(
+            plan_renames(&originals, "x/y\nb.txt\n")
+                .unwrap_err()
+                .contains("/")
+        );
+        assert!(
+            plan_renames(&originals, "c\nc\n")
+                .unwrap_err()
+                .contains("twice")
+        );
+        assert!(
+            plan_renames(&originals, "taken.txt\nb.txt\n")
+                .unwrap_err()
+                .contains("exists")
+        );
+        // Unchanged lines are left out; a trailing blank line is not a missing name.
+        let plan = plan_renames(&originals, "a.txt\nc.txt\n\n").unwrap();
+        assert_eq!(plan, [(b.clone(), tmp.path().join("c.txt"))]);
+        // Taking a name another item is vacating is allowed.
+        assert_eq!(plan_renames(&originals, "b.txt\na.txt").unwrap().len(), 2);
+    }
+
+    #[test]
+    fn renames_can_swap_and_chain() {
+        let tmp = TempDir::new();
+        let a = tmp.file("a", "was a");
+        let b = tmp.file("b", "was b");
+        let c = tmp.file("c", "was c");
+        let plan = plan_renames(&[a.clone(), b.clone(), c.clone()], "b\nc\na\n").unwrap();
+        assert_eq!(apply_renames(&plan).unwrap(), 3);
+        assert_eq!(fs::read_to_string(&b).unwrap(), "was a");
+        assert_eq!(fs::read_to_string(&c).unwrap(), "was b");
+        assert_eq!(fs::read_to_string(&a).unwrap(), "was c");
+        assert_eq!(
+            fs::read_dir(tmp.path()).unwrap().count(),
+            3,
+            "no temporary names left"
+        );
     }
 
     #[test]

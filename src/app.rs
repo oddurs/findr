@@ -232,6 +232,12 @@ pub fn parent_offset(selected: usize, len: usize, height: usize) -> usize {
         .min(len.saturating_sub(height))
 }
 
+/// A rename of several entries, waiting for the editor to return with the new names.
+struct BulkRename {
+    list: PathBuf,
+    originals: Vec<PathBuf>,
+}
+
 /// Work that needs the terminal, which `main` owns.
 pub enum Effect {
     Quit { write_cwd: bool },
@@ -256,6 +262,7 @@ pub struct App {
     pub marked: BTreeSet<PathBuf>,
     pub clip: Option<Clip>,
     pub job: Option<Job>,
+    bulk: Option<BulkRename>,
     pub git: Option<Repo>,
     pub message: Option<Message>,
     pub preview: Option<(preview::Key, Preview)>,
@@ -310,6 +317,7 @@ impl App {
             marked: BTreeSet::new(),
             clip: None,
             job: None,
+            bulk: None,
             git: None,
             message: None,
             preview: None,
@@ -579,10 +587,64 @@ impl App {
 
     /// After an editor or shell returns: whatever ran may have changed files, contents, or the index.
     pub fn after_run(&mut self, status: io::Result<ExitStatus>) {
+        let bulk = self.bulk.take();
+        match (&status, bulk) {
+            (Ok(status), Some(bulk)) => self.finish_bulk_rename(bulk, *status),
+            (Err(_), Some(bulk)) => {
+                // The editor never ran, so the list was never read; it is only a scratch file.
+                let _ = std::fs::remove_file(&bulk.list);
+            }
+            (_, None) => {}
+        }
         self.reload();
         self.sync_git(true);
         if let Err(e) = status {
             self.error(format!("could not start: {e}"));
+        }
+    }
+
+    /// Writes the marked names to a list, one per line, for the editor to change.
+    fn bulk_rename(&mut self) -> Option<Effect> {
+        let originals: Vec<PathBuf> = self.marked.iter().cloned().collect();
+        let list = env::temp_dir().join(format!("findr-rename-{}.txt", std::process::id()));
+        let names: String = originals
+            .iter()
+            .filter_map(|p| p.file_name())
+            .map(|n| format!("{}\n", n.to_string_lossy()))
+            .collect();
+        if let Err(e) = std::fs::write(&list, names) {
+            self.error(format!("{}: {e}", list.display()));
+            return None;
+        }
+        self.bulk = Some(BulkRename {
+            list: list.clone(),
+            originals,
+        });
+        Some(self.editor(&[list]))
+    }
+
+    fn finish_bulk_rename(&mut self, bulk: BulkRename, status: ExitStatus) {
+        let edited = std::fs::read_to_string(&bulk.list);
+        // The list was a scratch file; if it cannot be removed, a small file stays in the temp dir.
+        let _ = std::fs::remove_file(&bulk.list);
+        if !status.success() {
+            return self.error("the editor exited with an error; nothing renamed");
+        }
+        let edited = match edited {
+            Ok(text) => text,
+            Err(e) => return self.error(format!("{}: {e}", bulk.list.display())),
+        };
+        match ops::plan_renames(&bulk.originals, &edited) {
+            Err(e) => self.error(e),
+            Ok(plan) if plan.is_empty() => self.info("no names changed"),
+            Ok(plan) => match ops::apply_renames(&plan) {
+                Ok(n) => {
+                    // The marks named the old paths.
+                    self.marked.clear();
+                    self.success(format!("renamed {}", count(n)));
+                }
+                Err(e) => self.error(e.to_string()),
+            },
         }
     }
 
@@ -729,6 +791,8 @@ impl App {
                     self.mode = Mode::Confirm(Confirm::Trash(targets));
                 }
             }
+            // With marks, rename them all at once in the editor.
+            KeyCode::Char('r') if !self.marked.is_empty() => return self.bulk_rename(),
             KeyCode::Char('r') => {
                 if let Some(e) = self.selected() {
                     let stem = dir::split_ext(&e.name).0.chars().count();
@@ -1047,6 +1111,10 @@ impl App {
         if files.is_empty() {
             return None;
         }
+        Some(self.editor(&files))
+    }
+
+    fn editor(&self, files: &[PathBuf]) -> Effect {
         let editor = env::var("VISUAL")
             .or_else(|_| env::var("EDITOR"))
             .unwrap_or_else(|_| "vi".into());
@@ -1055,9 +1123,9 @@ impl App {
         cmd.arg("-c")
             .arg(format!("{editor} \"$@\""))
             .arg("sh")
-            .args(&files)
+            .args(files)
             .current_dir(&self.cwd);
-        Some(Effect::Run(cmd))
+        Effect::Run(cmd)
     }
 
     fn shell(&self) -> Effect {
@@ -1723,6 +1791,41 @@ mod tests {
             !key.diff,
             "a clean file shows its content even with diffs on"
         );
+    }
+
+    #[test]
+    fn marks_rename_together_in_the_editor() {
+        use std::os::unix::process::ExitStatusExt;
+        let (tmp, mut app) = setup();
+        press(&mut app, "j  ");
+        let Some(Effect::Run(_)) = app.handle_key(key(KeyCode::Char('r'))) else {
+            panic!("r with marks should open the editor");
+        };
+        let list = app.bulk.as_ref().unwrap().list.clone();
+        assert_eq!(
+            fs::read_to_string(&list).unwrap(),
+            "Cargo.toml\nREADME.md\n"
+        );
+        fs::write(&list, "Cargo.toml\nREAD_ME.md\n").unwrap();
+        app.after_run(Ok(ExitStatus::from_raw(0)));
+        assert!(tmp.path().join("READ_ME.md").exists());
+        assert!(!tmp.path().join("README.md").exists());
+        assert!(app.marked.is_empty());
+        assert_eq!(app.message().unwrap().text, "renamed 1 item");
+        assert!(!list.exists(), "the list is cleaned up");
+    }
+
+    #[test]
+    fn a_failed_editor_renames_nothing() {
+        use std::os::unix::process::ExitStatusExt;
+        let (tmp, mut app) = setup();
+        press(&mut app, "j  ");
+        app.handle_key(key(KeyCode::Char('r')));
+        let list = app.bulk.as_ref().unwrap().list.clone();
+        fs::write(&list, "x\ny\n").unwrap();
+        app.after_run(Ok(ExitStatus::from_raw(1 << 8)));
+        assert!(tmp.path().join("README.md").exists());
+        assert_eq!(app.message().unwrap().kind, MessageKind::Error);
     }
 
     #[test]
