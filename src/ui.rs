@@ -14,6 +14,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use crate::app::{App, Areas, Confirm, FIND_LIMIT, Finder, Mode, parent_offset};
 use crate::dir::{self, Entry};
 use crate::git::{Repo, Status};
+use crate::icons;
 use crate::preview::Preview;
 
 const SELECTED: Style = Style::new()
@@ -87,7 +88,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     draw_command(frame, app, command);
     match &app.mode {
         Mode::Help => draw_help(frame, body),
-        Mode::Find(finder) => draw_find(frame, finder, body),
+        Mode::Find(finder) => draw_find(frame, finder, body, app.icons),
         _ => {}
     }
 }
@@ -146,7 +147,8 @@ fn draw_parent(frame: &mut Frame, app: &App, area: Rect) {
         .take(height)
         .enumerate()
         .map(|(i, e)| {
-            let line = entry_line(e, &[], status(app.git.as_ref(), e), false, width, false);
+            let status = status(app.git.as_ref(), e);
+            let line = entry_line(e, &[], status, false, width, false, app.icons);
             if Some(offset + i) == app.parent_selected {
                 line.patch_style(PARENT_SELECTED)
             } else {
@@ -191,6 +193,7 @@ fn draw_current(frame: &mut Frame, app: &mut App, inner: Rect) {
                 app.marked.contains(&e.path),
                 width,
                 true,
+                app.icons,
             );
             if app.offset + i == app.selected {
                 line.patch_style(SELECTED)
@@ -224,6 +227,7 @@ fn draw_preview(frame: &mut Frame, app: &App, inner: Rect) {
                     false,
                     inner.width as usize,
                     true,
+                    app.icons,
                 )
             })
             .collect(),
@@ -277,6 +281,7 @@ fn entry_line(
     marked: bool,
     width: usize,
     with_size: bool,
+    icons: bool,
 ) -> Line<'static> {
     let mut spans = vec![
         if marked {
@@ -295,17 +300,25 @@ fn entry_line(
     } else {
         String::new()
     };
-    let reserved = 3 + if size.is_empty() { 0 } else { size.len() + 1 };
+    let base = name_style(entry, status);
+    // The glyph plus a space: Nerd Font icons are drawn wider than a cell and need the room.
+    let icon_width = if icons { 2 } else { 0 };
+    if icons {
+        let icon = icons::for_entry(entry);
+        let style = Style::new().fg(icon.color).add_modifier(base.add_modifier);
+        spans.push(Span::styled(format!("{} ", icon.glyph), style));
+    }
+    let gutter = 3 + icon_width;
+    let reserved = gutter + if size.is_empty() { 0 } else { size.len() + 1 };
     let room = width.saturating_sub(reserved);
     let mut name = entry.name.clone();
     if entry.is_dir {
         name.push('/');
     }
-    let base = name_style(entry, status);
     let hit = base.fg(Color::Yellow).add_modifier(Modifier::BOLD);
     let used = push_name(&mut spans, &name, hits, base, hit, room);
     if !size.is_empty() {
-        let pad = width.saturating_sub(3 + used + size.len());
+        let pad = width.saturating_sub(gutter + used + size.len());
         spans.push(Span::raw(" ".repeat(pad)));
         spans.push(Span::styled(size, DIM));
     }
@@ -502,7 +515,7 @@ fn draw_help(frame: &mut Frame, area: Rect) {
     frame.render_widget(Paragraph::new(lines).block(block), popup);
 }
 
-fn draw_find(frame: &mut Frame, finder: &Finder, area: Rect) {
+fn draw_find(frame: &mut Frame, finder: &Finder, area: Rect, icons: bool) {
     let width = (area.width * 9 / 10).max(20);
     let height = (area.height * 8 / 10).max(5);
     let popup = centered(area, width, height);
@@ -564,7 +577,7 @@ fn draw_find(frame: &mut Frame, finder: &Finder, area: Rect) {
         .skip(offset)
         .take(height)
         .map(|(i, m)| {
-            let line = find_line(&index.paths[m.idx], &m.hits, rows.width as usize);
+            let line = find_line(&index.paths[m.idx], &m.hits, rows.width as usize, icons);
             if i == finder.selected {
                 line.patch_style(SELECTED)
             } else {
@@ -577,15 +590,15 @@ fn draw_find(frame: &mut Frame, finder: &Finder, area: Rect) {
 
 /// A found path: its directory dimmed, the name bright, matches highlighted, and cut from the
 /// left when too long, since the end of a path is the part that tells files apart.
-fn find_line(path: &str, hits: &[usize], width: usize) -> Line<'static> {
+fn find_line(path: &str, hits: &[usize], width: usize, icons: bool) -> Line<'static> {
     let chars: Vec<char> = path.chars().collect();
     let is_dir = path.ends_with('/');
     let name_start = chars[..chars.len().saturating_sub(1)]
         .iter()
         .rposition(|&c| c == '/')
         .map_or(0, |i| i + 1);
-    // One column goes to the leading space.
-    let room = width.saturating_sub(1);
+    // One column goes to the leading space, two more to an icon and its gap.
+    let room = width.saturating_sub(if icons { 3 } else { 1 });
     let mut start = 0;
     let mut used: usize = chars.iter().map(|c| c.width().unwrap_or(0)).sum();
     if used > room {
@@ -603,6 +616,23 @@ fn find_line(path: &str, hits: &[usize], width: usize) -> Line<'static> {
         Style::new()
     };
     let mut spans = vec![Span::raw(" ")];
+    if icons {
+        let name = path
+            .trim_end_matches('/')
+            .rsplit('/')
+            .next()
+            .unwrap_or(path);
+        let kind = if is_dir {
+            icons::Kind::Dir
+        } else {
+            icons::Kind::File
+        };
+        let icon = icons::for_name(name, kind);
+        spans.push(Span::styled(
+            format!("{} ", icon.glyph),
+            Style::new().fg(icon.color),
+        ));
+    }
     if start > 0 {
         spans.push(Span::styled("…", DIM));
     }
@@ -702,7 +732,7 @@ mod tests {
                 .join("a-very-long-file-name-that-will-not-fit.txt"),
         )
         .unwrap();
-        let line = entry_line(&e, &[], None, false, 20, true);
+        let line = entry_line(&e, &[], None, false, 20, true, false);
         assert_eq!(line.width(), 20);
         let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(text.contains('…'), "{text}");
@@ -717,8 +747,11 @@ mod tests {
                 .map(|s| s.content.to_string())
                 .collect::<String>()
         };
-        assert_eq!(text(find_line("src/app.rs", &[4], 40)), " src/app.rs");
-        let long = find_line("a/very/deeply/nested/path/to/main.rs", &[], 16);
+        assert_eq!(
+            text(find_line("src/app.rs", &[4], 40, false)),
+            " src/app.rs"
+        );
+        let long = find_line("a/very/deeply/nested/path/to/main.rs", &[], 16, false);
         assert_eq!(text(long.clone()), " …ath/to/main.rs");
         assert_eq!(long.width(), 16);
     }

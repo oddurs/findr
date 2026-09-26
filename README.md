@@ -15,6 +15,8 @@ fuzzy filtering, and syntax-highlighted previews.
  -rw-r--r--  8.2 K  19m ago                                                 name↓  8/9
 ```
 
+- **File-type icons** from a [Nerd Font](https://www.nerdfonts.com), coloured the way your
+  editor colours them. `--no-icons` for a terminal without one.
 - **Three columns**: parent, current, preview. Previews are highlighted and built on a
   background thread, so holding `j` never stutters.
 - **Git status** on every entry, rolled up to directories, with ignored files dimmed and the
@@ -36,12 +38,15 @@ fuzzy filtering, and syntax-highlighted previews.
 cargo install --git https://github.com/oddurs/findr
 ```
 
-It runs on macOS and Linux, and needs `git` on your `PATH` for status.
+It runs on macOS and Linux, and needs `git` on your `PATH` for status. Icons need a
+[Nerd Font](https://www.nerdfonts.com) (v3) set as your terminal font — for example
+`brew install --cask font-jetbrains-mono-nerd-font`, then choose *JetBrainsMono Nerd Font* —
+or run with `--no-icons`.
 
 ## Usage
 
 ```
-findr [PATH] [--cwd-file FILE] [--no-mouse]
+findr [PATH] [--cwd-file FILE] [--no-mouse] [--no-icons]
 ```
 
 `PATH` may be a file, which opens its directory with the cursor on it. Press `?` for keys.

@@ -238,6 +238,8 @@ pub struct App {
     pub parent: Vec<Entry>,
     pub parent_selected: Option<usize>,
     pub show_hidden: bool,
+    /// Nerd Font icons beside names; off for terminals without the font.
+    pub icons: bool,
     pub sort: SortKey,
     pub reverse: bool,
     pub filter: String,
@@ -288,6 +290,7 @@ impl App {
             parent: Vec::new(),
             parent_selected: None,
             show_hidden: false,
+            icons: true,
             sort: SortKey::Name,
             reverse: false,
             filter: String::new(),
