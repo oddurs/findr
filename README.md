@@ -20,6 +20,8 @@ fuzzy filtering, and syntax-highlighted previews.
 - **Git status** on every entry, rolled up to directories, with ignored files dimmed and the
   branch in the header.
 - **Fuzzy filter** with `/`, ranked like fzf and smart-case.
+- **Find anywhere below** with `f` or `ctrl-p`: every file and directory under the current one,
+  honouring `.gitignore` in each repository it meets, including a directory full of checkouts.
 - **File operations**: copy, cut, paste, rename, trash, and `a src/new/mod.rs` to create a file with its parents.
 - **Hands off to your tools**: `$EDITOR`, a shell in the current directory, the system opener,
   and the clipboard.
@@ -52,6 +54,7 @@ findr [PATH] [--cwd-file FILE]
 | `-` | previous directory |
 | `:` | go to a path (`~` expands) |
 | `/` | fuzzy filter; `enter` keeps it, `esc` clears |
+| `f` `^p` | find anywhere below; `enter` goes there |
 | `space` | mark (marks apply to y x d e o c) |
 | `y` `x` `p` | copy, cut, paste |
 | `d` | move to trash (asks first) |

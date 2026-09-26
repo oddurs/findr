@@ -11,7 +11,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::app::{App, Confirm, Mode};
+use crate::app::{App, Confirm, FIND_LIMIT, Finder, Mode};
 use crate::dir::{self, Entry};
 use crate::git::{Repo, Status};
 use crate::preview::Preview;
@@ -31,6 +31,7 @@ const HELP: &[(&str, &str)] = &[
     ("-", "previous directory"),
     (":", "go to a path"),
     ("/", "fuzzy filter"),
+    ("f ^p", "find anywhere below (honours .gitignore)"),
     ("esc", "clear filter, then marks"),
     ("space", "mark"),
     ("y x p", "copy, cut, paste"),
@@ -69,8 +70,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     draw_preview(frame, app, preview);
     draw_status(frame, app, status);
     draw_command(frame, app, command);
-    if matches!(app.mode, Mode::Help) {
-        draw_help(frame, body);
+    match &app.mode {
+        Mode::Help => draw_help(frame, body),
+        Mode::Find(finder) => draw_find(frame, finder, body),
+        _ => {}
     }
 }
 
@@ -443,6 +446,10 @@ fn draw_command(frame: &mut Frame, app: &App, area: Rect) {
                 area,
             );
         }
+        Mode::Find(_) => {
+            let text = " find: ↑ ↓ move · enter go there · esc cancel";
+            frame.render_widget(Paragraph::new(Span::styled(text, DIM)), area);
+        }
         Mode::Goto => {
             let text = " g: g top · h home · r git root · / root";
             frame.render_widget(Paragraph::new(Span::styled(text, DIM)), area);
@@ -487,6 +494,136 @@ fn draw_help(frame: &mut Frame, area: Rect) {
     frame.render_widget(Clear, popup);
     let block = Block::bordered().title(" findr ").border_style(DIM);
     frame.render_widget(Paragraph::new(lines).block(block), popup);
+}
+
+fn draw_find(frame: &mut Frame, finder: &Finder, area: Rect) {
+    let width = (area.width * 9 / 10).max(20);
+    let height = (area.height * 8 / 10).max(5);
+    let popup = centered(area, width, height);
+    frame.render_widget(Clear, popup);
+    let block = Block::bordered().title(" find ").border_style(DIM);
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    if inner.height < 2 {
+        return;
+    }
+
+    let count = match &finder.index {
+        _ if finder.indexing() => "indexing…".to_string(),
+        Some(index) => {
+            // Only the best FIND_LIMIT are kept, so a full list means there were more.
+            let capped = if finder.matches.len() >= FIND_LIMIT {
+                "+"
+            } else {
+                ""
+            };
+            let cut = if index.truncated { "+" } else { "" };
+            format!(
+                "{}{capped}/{}{cut}",
+                finder.matches.len(),
+                index.paths.len()
+            )
+        }
+        None => String::new(),
+    };
+    let [prompt_area, count_area] = Layout::horizontal([
+        Constraint::Min(0),
+        Constraint::Length(count.width() as u16 + 1),
+    ])
+    .areas(Rect { height: 1, ..inner });
+    let prompt = Line::from(vec![
+        Span::styled(" › ", Style::new().fg(Color::Cyan)),
+        Span::raw(finder.query.clone()),
+    ]);
+    frame.render_widget(Paragraph::new(prompt), prompt_area);
+    frame.render_widget(Paragraph::new(Span::styled(count, DIM)), count_area);
+    let cursor = prompt_area.x + 3 + finder.query.width() as u16;
+    frame.set_cursor_position((cursor.min(prompt_area.right().saturating_sub(1)), inner.y));
+
+    let Some(index) = &finder.index else {
+        return;
+    };
+    let rows = Rect {
+        y: inner.y + 1,
+        height: inner.height - 1,
+        ..inner
+    };
+    let height = rows.height as usize;
+    // Keep the selection in view; the list is short enough to recompute every frame.
+    let offset = finder.selected.saturating_sub(height.saturating_sub(1));
+    let lines: Vec<Line> = finder
+        .matches
+        .iter()
+        .enumerate()
+        .skip(offset)
+        .take(height)
+        .map(|(i, m)| {
+            let line = find_line(&index.paths[m.idx], &m.hits, rows.width as usize);
+            if i == finder.selected {
+                line.patch_style(SELECTED)
+            } else {
+                line
+            }
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(lines), rows);
+}
+
+/// A found path: its directory dimmed, the name bright, matches highlighted, and cut from the
+/// left when too long, since the end of a path is the part that tells files apart.
+fn find_line(path: &str, hits: &[usize], width: usize) -> Line<'static> {
+    let chars: Vec<char> = path.chars().collect();
+    let is_dir = path.ends_with('/');
+    let name_start = chars[..chars.len().saturating_sub(1)]
+        .iter()
+        .rposition(|&c| c == '/')
+        .map_or(0, |i| i + 1);
+    // One column goes to the leading space.
+    let room = width.saturating_sub(1);
+    let mut start = 0;
+    let mut used: usize = chars.iter().map(|c| c.width().unwrap_or(0)).sum();
+    if used > room {
+        // Leave a column for the ellipsis.
+        while start < chars.len() && used > room.saturating_sub(1) {
+            used -= chars[start].width().unwrap_or(0);
+            start += 1;
+        }
+    }
+
+    let hit = Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD);
+    let name = if is_dir {
+        Style::new().fg(Color::Blue).add_modifier(Modifier::BOLD)
+    } else {
+        Style::new()
+    };
+    let mut spans = vec![Span::raw(" ")];
+    if start > 0 {
+        spans.push(Span::styled("…", DIM));
+    }
+    let mut hits = hits.iter().peekable();
+    while hits.next_if(|&&h| h < start).is_some() {}
+    let (mut run, mut run_style) = (String::new(), None);
+    for (i, &c) in chars.iter().enumerate().skip(start) {
+        let style = if hits.next_if(|&&h| h == i).is_some() {
+            hit
+        } else if i < name_start {
+            DIM
+        } else {
+            name
+        };
+        if run_style.is_some_and(|s| s != style) {
+            spans.push(Span::styled(
+                std::mem::take(&mut run),
+                run_style.unwrap_or_default(),
+            ));
+        }
+        run_style = Some(style);
+        run.push(if c.is_control() { '?' } else { c });
+    }
+    if !run.is_empty() {
+        spans.push(Span::styled(run, run_style.unwrap_or_default()));
+    }
+    Line::from(spans)
 }
 
 fn centered(area: Rect, width: u16, height: u16) -> Rect {
@@ -564,6 +701,20 @@ mod tests {
         let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(text.contains('…'), "{text}");
         assert!(text.ends_with("0 B"), "{text}");
+    }
+
+    #[test]
+    fn find_lines_cut_from_the_left() {
+        let text = |line: Line| {
+            line.spans
+                .iter()
+                .map(|s| s.content.to_string())
+                .collect::<String>()
+        };
+        assert_eq!(text(find_line("src/app.rs", &[4], 40)), " src/app.rs");
+        let long = find_line("a/very/deeply/nested/path/to/main.rs", &[], 16);
+        assert_eq!(text(long.clone()), " …ath/to/main.rs");
+        assert_eq!(long.width(), 16);
     }
 
     #[test]
